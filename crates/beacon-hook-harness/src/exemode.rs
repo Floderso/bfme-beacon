@@ -507,16 +507,31 @@ pub fn exe_mode(c: &mut Checks, dll: &Path) -> Result<(), String> {
         std::env::set_var("BEACON_LOG", scratch.path(&format!("hook-{variant}.log")));
         std::env::set_var("BEACON_USERDIR", scratch.path(&format!("userdir-{variant}")));
         std::env::remove_var("BEACON_TEST_ARMED_WITHOUT_EXE");
-        match launch(&exe, &dll_copy)? {
-            Launch::Exited(code) => {
-                c.eq(code, 0, &format!("exe-mode variant {variant} (exit code; its checks are listed above)"));
+        // The child's image base is randomised (ASLR); now and then its initial
+        // reservations cover image + 0x00F58000. A new child gets a new layout.
+        let mut attempt = 1;
+        loop {
+            match launch(&exe, &dll_copy)? {
+                Launch::Exited(code) => {
+                    c.eq(code, 0, &format!("exe-mode variant {variant} (exit code; its checks are listed above)"));
+                }
+                Launch::Blocked => println!("  note: Smart App Control blocked the exe copy; variant {variant} skipped"),
+                Launch::NoIdentity(_) if attempt < IDENTITY_ATTEMPTS => {
+                    attempt += 1;
+                    continue;
+                }
+                Launch::NoIdentity(e) => {
+                    c.ok(false, format_args!("variant {variant}: no identity after {attempt} children: {e}"));
+                }
             }
-            Launch::Blocked => println!("  note: Smart App Control blocked the exe copy; variant {variant} skipped"),
-            Launch::NoIdentity(e) => println!("  note: cannot prepare the identity ({e}); variant {variant} skipped"),
+            break;
         }
     }
     Ok(())
 }
+
+/// Children started per variant before giving up on a free import-block address.
+const IDENTITY_ATTEMPTS: u32 = 10;
 
 /// Previous `recvfrom` slot value, chained to by [`chained_recvfrom`].
 static PREVIOUS_RECVFROM: AtomicUsize = AtomicUsize::new(0);

@@ -89,8 +89,9 @@ slot meanwhile:
   (the other hook is chained in front of ours) the slot is left alone. If it is
   not, the game would bypass `recvfrom`/`recv` and see raw `DELIVER` frames from
   `127.0.0.1` while its `bind`/`sendto` are virtualised — so the hook **disarms**:
-  every export is passive from then on (empty LAN, one log line). It never
-  re-patches over a foreign hook, because chaining to it could loop back into us;
+  every export is passive from then on (the game uses the real network as without
+  Beacon; one log line). It never re-patches over a foreign hook, because chaining
+  to it could loop back into us;
 * an optional slot (registry, mutex, AppData) changed by a third module is left
   alone and logged.
 
@@ -218,7 +219,7 @@ is never logged.
   build/test tooling).
 * The re-verification probe calls a foreign hook with an invalid socket; a foreign
   hook that refuses invalid sockets without calling the next function looks like
-  a bypass, so the hook disarms (fail safe: empty LAN, logged) rather than risk a
+  a bypass, so the hook disarms (fail safe: passive, logged) rather than risk a
   call loop. Slots changed after the first `WSAStartup` are not detected.
 * In the system code, `setsockopt(IPPROTO_TCP, TCP_BSDURGENT)` with `optval == NULL`
   and `optlen >= 4` crashes; the proxy passes it to ws2_32 (`WSAEFAULT`) instead.

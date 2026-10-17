@@ -8,7 +8,7 @@
 //! compatibility shim engine, which may patch imports after the DLL initialisers)
 //! can have replaced a slot meanwhile. A WS2_32 slot whose function no longer
 //! reaches our hook (checked with a probe call, `ws2::reaches_hook`) would leave
-//! the game half-virtualised, so the hook then disarms (passive, empty LAN, logged).
+//! the game half-virtualised, so the hook then disarms (passive as without Beacon, logged).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -375,8 +375,13 @@ fn reverify_patches() -> Reverify {
                 // SAFETY: as above; the original is unchanged, so chaining is safe.
                 if unsafe { p.slot.patch(p.hook, p.orig) }.is_ok() {
                     rv.repatched += 1;
-                } else if p.probe.is_some() {
-                    rv.bypassed.get_or_insert(p.name);
+                } else {
+                    info!("IAT slot {} (rva {:#x}) holds the original again and cannot be re-patched", p.name, p.slot.rva());
+                    if p.probe.is_some() {
+                        rv.bypassed.get_or_insert(p.name);
+                    } else {
+                        rv.foreign += 1;
+                    }
                 }
             }
             SlotAction::Chained => {
@@ -431,7 +436,7 @@ fn write_report(r: &Report, rv: Reverify) {
     if let Some(name) = rv.bypassed {
         info!(
             "beacon-hook {version}: WS2_32!{name} no longer reaches the hook (IAT slot replaced by another \
-             module) - virtualisation disabled, staying passive (the game sees an empty LAN)"
+             module) - virtualisation disabled, staying passive (the game uses the real network as without Beacon)"
         );
         return;
     }

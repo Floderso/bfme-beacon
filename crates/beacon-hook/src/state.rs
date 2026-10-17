@@ -55,7 +55,8 @@ pub fn get() -> Option<&'static Armed> {
 }
 
 /// Turns the socket virtualisation off for the rest of the process (fail safe:
-/// the game then sees an empty LAN instead of half-virtualised sockets).
+/// the game then uses the real network as without Beacon, not half-virtualised
+/// sockets).
 pub fn disarm() {
     DISARMED.store(true, Ordering::Release);
 }
