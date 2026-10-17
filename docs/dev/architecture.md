@@ -161,8 +161,9 @@ Agent → hook (`DELIVER`), sent from the agent socket to the registered loopbac
 12 .. payload (≤ 480 bytes; larger payloads are dropped by the agent)
 ```
 The agent learns `vport → loopback endpoint` from `REG` (and from every `SEND`'s
-source). Self-addressed datagrams (dst = own VIP or broadcast including self? —
-broadcasts are **not** delivered back to the sender) are looped back locally.
+source). Unicast datagrams addressed to the agent's own VIP are looped back
+locally by the agent (never sent to the server). Broadcasts are never delivered
+back to the sending game instance — neither by the agent nor by the server.
 
 ## 6. Relay protocol (agent ↔ server, UDP, one port)
 
