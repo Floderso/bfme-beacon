@@ -13,10 +13,10 @@ use beacon_proto::local::{FrameType, HookFrame, MAX_DELIVER_PAYLOAD};
 use crate::agent::{Agent, Frame};
 use crate::win::{self, Module, SockAddrIn, Ws};
 
-const VIP: [u8; 4] = [198, 18, 0, 5];
-const TOKEN: u32 = 0xC0FF_EE42;
-const TOKEN_TEXT: &str = "c0ffee42";
-const SERIAL: &str = "ABCDEFGHIJ0123456789";
+pub(crate) const VIP: [u8; 4] = [198, 18, 0, 5];
+pub(crate) const TOKEN: u32 = 0xC0FF_EE42;
+pub(crate) const TOKEN_TEXT: &str = "c0ffee42";
+pub(crate) const SERIAL: &str = "ABCDEFGHIJ0123456789";
 const ANY: [u8; 4] = [0, 0, 0, 0];
 const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
 const FRAME_WAIT: Duration = Duration::from_secs(2);
@@ -66,16 +66,16 @@ impl Checks {
 }
 
 /// Scratch directory of one scenario (removed on drop unless keeping logs).
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new(scenario: &str) -> Result<Self, String> {
+    pub(crate) fn new(scenario: &str) -> Result<Self, String> {
         let dir = std::env::temp_dir().join(format!("beacon-hook-harness-{}-{scenario}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         Ok(Self(dir))
     }
 
-    fn path(&self, name: &str) -> PathBuf {
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
 }
@@ -100,7 +100,7 @@ fn arm_env(agent: &Agent, vip: &str, log: &Path) {
     set("BEACON_LOG_LEVEL", "debug");
 }
 
-fn read_log(path: &Path) -> String {
+pub(crate) fn read_log(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
@@ -121,7 +121,7 @@ fn recv_poll(ws: &Ws, s: usize, buf: &mut [u8], flags: i32) -> (i32, SockAddrIn,
     (-1, SockAddrIn::default(), 0, win::WSAEWOULDBLOCK)
 }
 
-fn expect_frame(c: &mut Checks, agent: &Agent, kind: FrameType, what: &str) -> Option<Frame> {
+pub(crate) fn expect_frame(c: &mut Checks, agent: &Agent, kind: FrameType, what: &str) -> Option<Frame> {
     match agent.next(FRAME_WAIT) {
         Ok(f) => {
             c.eq(f.header.kind, kind, &format!("{what}: frame type"));
@@ -554,5 +554,64 @@ pub fn bad_config(c: &mut Checks, dll: &Path) -> Result<(), String> {
     c.eq(ws.cleanup(), 0, "WSACleanup");
     let text = read_log(&log);
     c.ok(text.contains("configuration error: BEACON_VIP"), format_args!("log explains the error: {text:?}"));
+    Ok(())
+}
+
+/// A virtual socket closed behind the hook's back (by another module calling
+/// ws2_32 directly, or by the process's last `WSACleanup`) must not turn a later
+/// socket with the same handle value into a virtual one: `socket()` forgets the
+/// stale entry for any new handle, and a stale vport is reclaimed by the liveness
+/// check.
+pub fn stale_handles(c: &mut Checks, dll: &Path) -> Result<(), String> {
+    let scratch = Scratch::new("stale-handles")?;
+    let log = scratch.path("hook.log");
+    let agent = Agent::new().map_err(|e| format!("fake agent: {e}"))?;
+    arm_env(&agent, "198.18.0.5", &log);
+    set("BEACON_TEST_ARMED_WITHOUT_EXE", "1");
+    let (_module, ws) = load(c, dll)?;
+
+    // 1. A TCP socket that gets the stale handle value.
+    let s = ws.socket(0);
+    c.eq(ws.bind(s, VIP, 8088), 0, "bind VIP:8088");
+    let _ = expect_frame(c, &agent, FrameType::Reg, "REG 8088");
+    c.eq(win::real_closesocket(s), 0, "close it behind the hook (ws2_32 directly)");
+    // Handle tables hand out freed slots again: open TCP sockets until one gets
+    // the old handle value.
+    let mut opened = Vec::new();
+    let mut reused = false;
+    for _ in 0..64 {
+        let t = ws.socket_stream();
+        if t == win::INVALID_SOCKET {
+            break;
+        }
+        opened.push(t);
+        if t == s {
+            reused = true;
+            break;
+        }
+    }
+    if c.ok(reused, format_args!("handle {s:#x} reused by a new TCP socket ({} tried)", opened.len())) {
+        c.eq(ws.sockname(s).map(|_| ()), Err(win::WSAEINVAL), "reused handle (unbound TCP): getsockname is native");
+        let mut buf = [0u8; 16];
+        let r = ws.recv(s, &mut buf);
+        c.eq((r, ws.err()), (-1, win::WSAENOTCONN), "reused handle: recv is native");
+    }
+    for t in opened {
+        ws.close(t);
+    }
+    c.ok(agent.unexpected(SILENCE).is_none(), "no CLOSE frame for the TCP socket");
+    c.ok(read_log(&log).contains("handle reused, forgot stale Virtual entry (vport 8088)"), "log: stale entry forgotten");
+
+    // 2. A vport held by a socket closed behind the hook is reclaimed on bind.
+    let a = ws.socket(0);
+    c.eq(ws.bind(a, VIP, 8089), 0, "bind VIP:8089");
+    let _ = expect_frame(c, &agent, FrameType::Reg, "REG 8089");
+    c.eq(win::real_closesocket(a), 0, "close it behind the hook");
+    let b = ws.socket(0);
+    c.eq(ws.bind(b, VIP, 8089), 0, "vport 8089 reclaimed by a new socket");
+    let _ = expect_frame(c, &agent, FrameType::Reg, "REG 8089 again");
+    ws.close(b);
+    let _ = agent.next(SILENCE);
+    c.eq(ws.cleanup(), 0, "WSACleanup");
     Ok(())
 }

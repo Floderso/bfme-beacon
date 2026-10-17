@@ -10,7 +10,7 @@ Beacon agent on loopback (`BCN1` frames, `beacon_proto::local`).
 . /d/BFME-RE/env.sh
 cargo hook            # -> <target>/i686-pc-windows-gnullvm/release-hook/wsock32.dll
 python crates/beacon-hook/tools/check_exports.py <target>/i686-pc-windows-gnullvm/release-hook/wsock32.dll
-cargo hook-harness    # 32-bit harness, 5 scenarios in child processes (crates/beacon-hook-harness)
+cargo hook-harness    # 32-bit harness, 7 scenarios in child processes (crates/beacon-hook-harness)
 cargo test -p beacon-hook [--target i686-pc-windows-gnullvm]
 ```
 
@@ -78,9 +78,21 @@ by a unit test that maps the files like the loader (skipped where BFME is absent
 `DllMain(PROCESS_ATTACH)` only reads the environment, checks the identity, patches
 IAT slots and publishes the armed state — no threads, sockets, `LoadLibrary` or file
 I/O under the loader lock. The first `WSAStartup` writes the start-up report to the
-log and re-verifies the patches (a slot that holds the original pointer again is
-re-patched; a slot changed by a third module is left alone and logged, because
-chaining to it could loop back into the hook).
+log and re-verifies the patches, because another module (e.g. the compatibility
+shim engine, which can patch imports after the DLL initialisers) may have changed a
+slot meanwhile:
+
+* a slot that holds the loader's original again is patched again;
+* a WS2_32 slot that holds a third module's function is **probed**: the function is
+  called with a sentinel socket (`ws2::reaches_hook`, `0x7FFFFFF3`, thread-checked;
+  ws2_32 answers `WSAENOTSOCK` if the call never reaches us). If our hook is reached
+  (the other hook is chained in front of ours) the slot is left alone. If it is
+  not, the game would bypass `recvfrom`/`recv` and see raw `DELIVER` frames from
+  `127.0.0.1` while its `bind`/`sendto` are virtualised — so the hook **disarms**:
+  every export is passive from then on (empty LAN, one log line). It never
+  re-patches over a foreign hook, because chaining to it could loop back into us;
+* an optional slot (registry, mutex, AppData) changed by a third module is left
+  alone and logged.
 
 ## Environment
 
@@ -166,9 +178,11 @@ reads an empty serial, which BFME's dupe check accepts.
 Bookkeeping: fixed table of 64 entries (`src/vtable.rs`) behind a `std` mutex,
 held only for table operations, never across a system call. No allocation and no
 threads anywhere; the hot path uses stack buffers. Stale entries (sockets closed
-behind the hook's back, e.g. by the last `WSACleanup`) are detected by a liveness
-check (`getsockname` must still show the recorded loopback port) when they block a
-bind or the table is full.
+behind the hook's back, e.g. by another module calling ws2_32 directly or by the
+process's last `WSACleanup`) are dropped when `socket`/`accept` hand out the same
+handle value again (a new TCP socket on a reused handle must not be treated as the
+old virtual one), and are detected by a liveness check (`getsockname` must still
+show the recorded loopback port) when they block a bind or the table is full.
 
 ## Logging
 
@@ -196,10 +210,16 @@ is never logged.
   (unused) GameSpy/WWDownload paths.
 * `BEACON_USERDIR` that is not representable in the ANSI code page: the A variant of
   `SHGetSpecialFolderPath` passes through (maps/replays then share the real
-  folder); logged.
-* The exe-mode IAT patching is verified by unit tests on synthetic images and the
-  slot lookup on the real exe file; it is not exercised in a running game here
-  (the game must not be launched by the build/test tooling).
+  folder); logged. (With the UTF-8 ANSI code page every path is representable.)
+* Exe mode is exercised by the harness (`exe-mode`) in a copy of the harness exe
+  whose in-memory image gets the game's identity before its loader runs, so the
+  real loader snaps the IATs and runs `DllMain` at process start; it is not
+  exercised in the running game here (the game must not be launched by the
+  build/test tooling).
+* The re-verification probe calls a foreign hook with an invalid socket; a foreign
+  hook that refuses invalid sockets without calling the next function looks like
+  a bypass, so the hook disarms (fail safe: empty LAN, logged) rather than risk a
+  call loop. Slots changed after the first `WSAStartup` are not detected.
 * In the system code, `setsockopt(IPPROTO_TCP, TCP_BSDURGENT)` with `optval == NULL`
   and `optlen >= 4` crashes; the proxy passes it to ws2_32 (`WSAEFAULT`) instead.
 

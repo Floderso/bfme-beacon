@@ -21,7 +21,12 @@ pub struct Agent {
 
 impl Agent {
     pub fn new() -> io::Result<Self> {
-        let sock = UdpSocket::bind("127.0.0.1:0")?;
+        Self::bind(0)
+    }
+
+    /// An agent on `127.0.0.1:port` (0 = any free port).
+    pub fn bind(port: u16) -> io::Result<Self> {
+        let sock = UdpSocket::bind(("127.0.0.1", port))?;
         Ok(Self { sock })
     }
 

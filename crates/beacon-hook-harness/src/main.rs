@@ -14,6 +14,8 @@
 #[cfg(windows)]
 mod agent;
 #[cfg(windows)]
+mod exemode;
+#[cfg(windows)]
 mod scenarios;
 #[cfg(windows)]
 mod win;
@@ -36,17 +38,23 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitCode};
 
+    use crate::exemode;
     use crate::scenarios::{self, Checks};
 
     type Scenario = fn(&mut Checks, &Path) -> Result<(), String>;
 
-    const SCENARIOS: [(&str, Scenario); 5] = [
+    const SCENARIOS: [(&str, Scenario); 7] = [
         ("passive", scenarios::passive),
         ("armed", scenarios::armed),
         ("multi", scenarios::multi),
         ("not-the-game", scenarios::not_the_game),
         ("bad-config", scenarios::bad_config),
+        ("stale-handles", scenarios::stale_handles),
+        ("exe-mode", exemode::exe_mode),
     ];
+
+    /// Started only by the `exe-mode` scenario, inside the identity copy.
+    const INNER: [(&str, Scenario); 1] = [("exe-inner", exemode::exe_inner)];
 
     fn default_dll() -> Option<PathBuf> {
         if let Some(p) = std::env::var_os("BEACON_HOOK_DLL") {
@@ -85,7 +93,7 @@ mod imp {
     }
 
     fn run_child(name: &str, dll: &Path) -> ExitCode {
-        let Some((scenario, run)) = SCENARIOS.iter().find(|(n, _)| *n == name) else {
+        let Some((scenario, run)) = SCENARIOS.iter().chain(INNER.iter()).find(|(n, _)| *n == name) else {
             eprintln!("unknown scenario {name}");
             return ExitCode::from(2);
         };

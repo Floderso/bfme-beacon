@@ -18,9 +18,12 @@ extern "system" {
     fn ws2_gethostname(name: *mut u8, len: i32) -> i32;
     #[link_name = "getsockname"]
     fn ws2_getsockname(s: usize, name: *mut SockAddrIn, len: *mut i32) -> i32;
+    #[link_name = "closesocket"]
+    fn ws2_closesocket(s: usize) -> i32;
 }
 
 pub const AF_INET: u16 = 2;
+pub const SOCK_STREAM: i32 = 1;
 pub const SOCK_DGRAM: i32 = 2;
 pub const IPPROTO_IP: i32 = 0;
 pub const IPPROTO_UDP: i32 = 17;
@@ -33,11 +36,13 @@ pub const INVALID_SOCKET: usize = !0;
 
 pub const WSAEACCES: i32 = 10013;
 pub const WSAEFAULT: i32 = 10014;
+pub const WSAEINVAL: i32 = 10022;
 pub const WSAEWOULDBLOCK: i32 = 10035;
 pub const WSAENOTSOCK: i32 = 10038;
 pub const WSAEMSGSIZE: i32 = 10040;
 pub const WSAEADDRINUSE: i32 = 10048;
 pub const WSAEADDRNOTAVAIL: i32 = 10049;
+pub const WSAENOTCONN: i32 = 10057;
 
 /// `sockaddr_in` with network-order byte fields.
 #[repr(C, align(4))]
@@ -193,6 +198,12 @@ impl Ws {
         unsafe { (self.socket)(i32::from(AF_INET), SOCK_DGRAM, protocol) }
     }
 
+    /// `socket(AF_INET, SOCK_STREAM, 0)`.
+    pub fn socket_stream(&self) -> usize {
+        // SAFETY: plain values.
+        unsafe { (self.socket)(i32::from(AF_INET), SOCK_STREAM, 0) }
+    }
+
     pub fn bind(&self, s: usize, ip: [u8; 4], port: u16) -> i32 {
         let sa = SockAddrIn::new(ip, port);
         // SAFETY: valid sockaddr_in.
@@ -337,6 +348,13 @@ pub fn real_sockname(s: usize) -> Option<SockAddrIn> {
     let mut len = 16;
     // SAFETY: valid out-parameters.
     (unsafe { ws2_getsockname(s, &mut sa, &mut len) } == 0).then_some(sa)
+}
+
+/// Closes a socket with ws2_32 directly, behind the hook's back (like another
+/// module or a last `WSACleanup` would).
+pub fn real_closesocket(s: usize) -> i32 {
+    // SAFETY: plain value.
+    unsafe { ws2_closesocket(s) }
 }
 
 fn c_string(buf: &[u8]) -> String {
