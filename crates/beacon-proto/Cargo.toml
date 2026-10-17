@@ -1,0 +1,44 @@
+[package]
+name = "beacon-proto"
+description = "BFME Beacon wire formats, crypto helpers and shared constants"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+default = ["control"]
+# TCP control channel (server hello, Argon2id PSK, Noise parameters, framing,
+# JSON messages) and game-data fingerprint types. The 32-bit hook builds with
+# `--no-default-features` and only gets `net`, `env` and `relay`.
+control = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:snow",
+    "dep:argon2",
+    "dep:base64",
+    "dep:blake3",
+]
+
+[dependencies]
+# Relay (always on). Pure Rust; no default features (no alloc/getrandom needed).
+chacha20poly1305 = { version = "0.10.1", default-features = false }
+
+# Control channel (feature "control"). Everything pure Rust, no C/asm builds.
+serde = { version = "1.0.219", features = ["derive"], optional = true }
+serde_json = { version = "1.0.140", optional = true }
+# Default features are off on purpose: snow 0.10's "std" feature enables the
+# optional `ring` dependency (C/asm). We only need 25519 + ChaChaPoly + BLAKE2s.
+snow = { version = "0.10.0", default-features = false, features = [
+    "use-curve25519",
+    "use-chacha20poly1305",
+    "use-blake2",
+    "use-getrandom",
+], optional = true }
+# No default features: avoids `password-hash`; we allocate the Argon2 blocks ourselves.
+argon2 = { version = "0.5.3", default-features = false, optional = true }
+# No default features: avoids the `simd-unsafe` engine.
+base64 = { version = "0.23.1", default-features = false, features = ["std"], optional = true }
+# "pure": no C/assembly build (Rust SIMD intrinsics are still used on x86).
+blake3 = { version = "1.8.7", features = ["pure"], optional = true }
