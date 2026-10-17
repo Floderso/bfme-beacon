@@ -1,0 +1,4 @@
+# Nur Binary und Dockerfile in den Build-Kontext (nicht maps/, data/, config.toml).
+*
+!beacon-server
+!Dockerfile

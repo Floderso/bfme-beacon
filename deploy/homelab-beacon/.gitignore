@@ -1,0 +1,4 @@
+# Lokale Testläufe: Binary, Daten und Karten gehören nicht ins Repo.
+/beacon-server
+/data/
+/maps/

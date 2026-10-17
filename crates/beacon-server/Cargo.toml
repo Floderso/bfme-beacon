@@ -1,0 +1,45 @@
+[package]
+name = "beacon-server"
+description = "BFME Beacon home server: TCP control channel (Noise), UDP relay, lobby, map repository, status endpoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "beacon-server"
+path = "src/main.rs"
+
+[lib]
+name = "beacon_server"
+path = "src/lib.rs"
+
+[dependencies]
+# Wire formats and crypto; use its `snow`/`blake3` re-exports (pure Rust, no `ring`).
+beacon-proto = { path = "../beacon-proto" }
+# Async runtime. No default features; only what the server uses.
+tokio = { version = "1.53.3", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+    "signal",
+    "io-util",
+] }
+# Status endpoint (HTTP/1 only, JSON).
+axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+# Config file. Parsing + serde only (the server edits its config textually).
+toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+# Salt, relay keys, session ids (same version as snow's).
+getrandom = "0.3.4"
+# Dual-stack bind ("[::]") and socket buffer sizes.
+socket2 = "0.6"
+
+[lints.rust]
+unsafe_code = "forbid"
