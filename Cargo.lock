@@ -110,6 +110,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "beacon-launcher"
+version = "0.1.0"
+dependencies = [
+ "beacon-proto",
+ "beacon-server",
+ "getrandom",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys",
+]
+
+[[package]]
 name = "beacon-proto"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,56 @@
+[package]
+name = "beacon-launcher"
+description = "BFME Beacon launcher (Beacon.exe): control client, agent, game detection, hook install, map sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "Beacon"
+path = "src/main.rs"
+
+[lib]
+name = "beacon_launcher"
+path = "src/lib.rs"
+
+[dependencies]
+# Wire formats and crypto; use its `snow`/`blake3` re-exports (pure Rust, no `ring`).
+beacon-proto = { path = "../beacon-proto" }
+# Async runtime (same feature set as the server, no default features).
+tokio = { version = "1.53.3", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+    "signal",
+    "io-util",
+] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+# Local token, handover token, jitter (same version as snow's).
+getrandom = "0.3.4"
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI, SHA-256 (CNG), registry, named mutex, console attach. Already in the
+# dependency graph through tokio/socket2/getrandom (raw-dylib, no import libs).
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# In-process server for the integration tests (tests/app.rs).
+beacon-server = { path = "../beacon-server" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
