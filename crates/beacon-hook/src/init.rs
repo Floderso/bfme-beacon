@@ -4,7 +4,11 @@
 //! check the exe identity (in-memory headers), patch IAT slots (`VirtualProtect`)
 //! and publish the armed state. No threads, no sockets, no `LoadLibrary`, no file
 //! I/O. The start-up report is written to the log by the first `WSAStartup`, which
-//! also re-verifies the IAT patches (spec 03 §8.4).
+//! also re-verifies the IAT patches (spec 03 §8.4): another module (e.g. the
+//! compatibility shim engine, which may patch imports after the DLL initialisers)
+//! can have replaced a slot meanwhile. A WS2_32 slot whose function no longer
+//! reaches our hook (checked with a probe call, `ws2::reaches_hook`) would leave
+//! the game half-virtualised, so the hook then disarms (passive, empty LAN, logged).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -25,6 +29,9 @@ struct Patch {
     slot: Slot,
     hook: usize,
     orig: &'static AtomicUsize,
+    /// `Some(index in ws2::NAMES)` for the mandatory WS2_32 hooks (re-verified with
+    /// a reachability probe); `None` for the optional ones.
+    probe: Option<usize>,
 }
 
 /// Fixed list of installed patches.
@@ -234,7 +241,7 @@ fn install_ws2(img: &LiveImage, list: &mut PatchList) -> Result<Headers, Ws2Fail
             break;
         }
         if let Some(d) = done.get_mut(i) {
-            *d = Some(Patch { name, slot, hook, orig });
+            *d = Some(Patch { name, slot, hook, orig, probe: Some(i) });
         }
     }
     if let Err(failure) = result {
@@ -273,7 +280,7 @@ fn install_optional(
     // SAFETY: the slot lies in the main module's IAT; loader lock held.
     match unsafe { slot.patch(hook, orig) } {
         Ok(()) => {
-            list.push(Patch { name, slot, hook, orig });
+            list.push(Patch { name, slot, hook, orig, probe: None });
             Optional::Patched
         }
         Err(e) => Optional::Failed(e),
@@ -291,33 +298,105 @@ pub fn on_wsastartup() {
     }
 }
 
-/// Re-checks every patched slot. A slot that holds the original pointer again
-/// (re-snapped) is patched again; a slot holding a third value (another hooking
-/// module) is left alone — chaining to it could loop back into us.
-fn reverify_patches() -> (usize, usize) {
-    let Some(list) = PATCHES.get() else {
-        return (0, 0);
+/// What the re-verification does with one patched slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotAction {
+    /// Still holds our hook.
+    Intact,
+    /// Holds the loader's original again (re-snapped): patch it again.
+    Repatch,
+    /// A WS2_32 slot holding another module's hook that still reaches ours.
+    Chained,
+    /// An optional slot replaced by another module: left alone (chaining to it
+    /// could loop back into us), logged.
+    LeaveForeign,
+    /// A WS2_32 slot whose function no longer reaches our hook: disarm.
+    Bypassed,
+}
+
+/// Decides about one slot. `current` is the slot value (`None` = unreadable),
+/// `mandatory` marks the WS2_32 slots and `reaches` probes whether a function
+/// reaches our hook (only called for a foreign value of a mandatory slot).
+fn classify_slot(
+    current: Option<usize>,
+    hook: usize,
+    orig: usize,
+    mandatory: bool,
+    reaches: impl FnOnce(usize) -> bool,
+) -> SlotAction {
+    let Some(current) = current else {
+        return if mandatory { SlotAction::Bypassed } else { SlotAction::LeaveForeign };
     };
-    let (mut repatched, mut foreign) = (0, 0);
+    if current == hook {
+        SlotAction::Intact
+    } else if current == orig {
+        SlotAction::Repatch
+    } else if !mandatory {
+        SlotAction::LeaveForeign
+    } else if reaches(current) {
+        SlotAction::Chained
+    } else {
+        SlotAction::Bypassed
+    }
+}
+
+/// Result of [`reverify_patches`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Reverify {
+    /// Slots that held the original again and were patched again.
+    repatched: usize,
+    /// WS2_32 slots holding another module's hook that chains to ours.
+    chained: usize,
+    /// Optional slots replaced by another module (left alone).
+    foreign: usize,
+    /// The first WS2_32 import whose slot bypasses our hook (then disarmed).
+    bypassed: Option<&'static str>,
+}
+
+/// Re-checks every patched slot (see [`SlotAction`]); disarms the hook if a
+/// WS2_32 slot bypasses it.
+fn reverify_patches() -> Reverify {
+    let mut rv = Reverify::default();
+    let Some(list) = PATCHES.get() else {
+        return rv;
+    };
     for p in list.iter() {
         // SAFETY: slots of the main module's IAT (validated when patched).
-        let Ok(current) = (unsafe { p.slot.load() }) else {
-            continue;
-        };
-        if current == p.hook {
-            continue;
-        }
-        if current == p.orig.load(Ordering::Acquire) {
-            // SAFETY: as above; the original is unchanged, so chaining is safe.
-            if unsafe { p.slot.patch(p.hook, p.orig) }.is_ok() {
-                repatched += 1;
+        let current = unsafe { p.slot.load() }.ok();
+        let orig = p.orig.load(Ordering::Acquire);
+        let action = classify_slot(current, p.hook, orig, p.probe.is_some(), |f| match p.probe {
+            // SAFETY: `f` is the current value of the IAT slot of `ws2::NAMES[i]`.
+            Some(i) => unsafe { ws2::reaches_hook(i, f) },
+            None => false,
+        });
+        match action {
+            SlotAction::Intact => {}
+            SlotAction::Repatch => {
+                // SAFETY: as above; the original is unchanged, so chaining is safe.
+                if unsafe { p.slot.patch(p.hook, p.orig) }.is_ok() {
+                    rv.repatched += 1;
+                } else if p.probe.is_some() {
+                    rv.bypassed.get_or_insert(p.name);
+                }
             }
-        } else {
-            foreign += 1;
-            info!("IAT slot {} (rva {:#x}) was replaced by another module; left alone", p.name, p.slot.rva());
+            SlotAction::Chained => {
+                rv.chained += 1;
+                info!("IAT slot {} (rva {:#x}) holds another module's hook that still reaches ours", p.name, p.slot.rva());
+            }
+            SlotAction::LeaveForeign => {
+                rv.foreign += 1;
+                info!("IAT slot {} (rva {:#x}) was replaced by another module; left alone", p.name, p.slot.rva());
+            }
+            SlotAction::Bypassed => {
+                rv.bypassed.get_or_insert(p.name);
+                info!("IAT slot {} (rva {:#x}) was replaced by another module that bypasses the hook", p.name, p.slot.rva());
+            }
         }
     }
-    (repatched, foreign)
+    if rv.bypassed.is_some() {
+        state::disarm();
+    }
+    rv
 }
 
 fn optional_text(o: Optional) -> &'static str {
@@ -332,7 +411,7 @@ fn optional_text(o: Optional) -> &'static str {
     }
 }
 
-fn write_report(r: &Report, (repatched, foreign): (usize, usize)) {
+fn write_report(r: &Report, rv: Reverify) {
     let version = env!("CARGO_PKG_VERSION");
     let mode = if r.exe_mode { "lotrbfme.exe 1.03" } else { "BEACON_TEST_ARMED_WITHOUT_EXE" };
     match r.outcome {
@@ -349,15 +428,24 @@ fn write_report(r: &Report, (repatched, foreign): (usize, usize)) {
     let Some(cfg) = r.config else {
         return;
     };
-    let host = state::get().map(|s| core::str::from_utf8(s.hostname()).unwrap_or("?")).unwrap_or("?");
+    if let Some(name) = rv.bypassed {
+        info!(
+            "beacon-hook {version}: WS2_32!{name} no longer reaches the hook (IAT slot replaced by another \
+             module) - virtualisation disabled, staying passive (the game sees an empty LAN)"
+        );
+        return;
+    }
+    let (hostname, hostname_len) = state::hostname_for(cfg.vip);
+    let host = hostname.get(..hostname_len).and_then(|h| core::str::from_utf8(h).ok()).unwrap_or("?");
     info!(
         "beacon-hook {version}: armed ({mode}); vip {} host {host}, agent 127.0.0.1:{}",
         cfg.vip, cfg.agent_port
     );
     if r.exe_mode {
         info!(
-            "IAT: WS2_32 WSAIoctl/getsockopt/recv/recvfrom/setsockopt patched{}; RegQueryValueExA {}, RegQueryValueExW {}",
-            if repatched > 0 { " (re-patched after re-snap)" } else { "" },
+            "IAT: WS2_32 WSAIoctl/getsockopt/recv/recvfrom/setsockopt patched{}{}; RegQueryValueExA {}, RegQueryValueExW {}",
+            if rv.repatched > 0 { " (re-patched after re-snap)" } else { "" },
+            if rv.chained > 0 { " (chained behind another module)" } else { "" },
             optional_text(r.reg_a),
             optional_text(r.reg_w)
         );
@@ -371,8 +459,8 @@ fn write_report(r: &Report, (repatched, foreign): (usize, usize)) {
                 optional_text(r.folder_w)
             );
         }
-        if foreign > 0 {
-            info!("{foreign} IAT slot(s) replaced by another module before the first WSAStartup");
+        if rv.foreign > 0 {
+            info!("{} IAT slot(s) replaced by another module before the first WSAStartup", rv.foreign);
         }
     }
     if cfg.serial.is_none() {
@@ -387,5 +475,28 @@ fn write_report(r: &Report, (repatched, foreign): (usize, usize)) {
             info!("BEACON_MULTI=1 but BEACON_USERDIR is not an absolute path <= 200 chars - test mode off");
         }
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_reverification_decisions() {
+        let (hook, orig, other) = (0x1000usize, 0x2000usize, 0x3000usize);
+        let never = |_: usize| -> bool { panic!("no probe expected") };
+        assert_eq!(classify_slot(Some(hook), hook, orig, true, never), SlotAction::Intact);
+        assert_eq!(classify_slot(Some(hook), hook, orig, false, never), SlotAction::Intact);
+        // Re-snapped to the loader's original: patch again (mandatory or not).
+        assert_eq!(classify_slot(Some(orig), hook, orig, true, never), SlotAction::Repatch);
+        assert_eq!(classify_slot(Some(orig), hook, orig, false, never), SlotAction::Repatch);
+        // Optional slot taken over by another module: left alone, no probe.
+        assert_eq!(classify_slot(Some(other), hook, orig, false, never), SlotAction::LeaveForeign);
+        assert_eq!(classify_slot(None, hook, orig, false, never), SlotAction::LeaveForeign);
+        // WS2_32 slot taken over: the probe decides between chained and bypassed.
+        assert_eq!(classify_slot(Some(other), hook, orig, true, |f| f == other), SlotAction::Chained);
+        assert_eq!(classify_slot(Some(other), hook, orig, true, |_| false), SlotAction::Bypassed);
+        assert_eq!(classify_slot(None, hook, orig, true, never), SlotAction::Bypassed);
     }
 }

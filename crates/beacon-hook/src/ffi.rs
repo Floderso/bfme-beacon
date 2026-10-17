@@ -55,6 +55,8 @@ pub const WSAEACCES: i32 = 10013;
 pub const WSAEFAULT: i32 = 10014;
 /// `WSAEWOULDBLOCK`.
 pub const WSAEWOULDBLOCK: i32 = 10035;
+/// `WSAENOTSOCK`.
+pub const WSAENOTSOCK: i32 = 10038;
 /// `WSAEMSGSIZE`.
 pub const WSAEMSGSIZE: i32 = 10040;
 /// `WSAEAFNOSUPPORT`.
@@ -86,6 +88,11 @@ pub const INVALID_HANDLE_VALUE: isize = -1;
 pub const CP_ACP: u32 = 0;
 /// `WC_NO_BEST_FIT_CHARS`.
 pub const WC_NO_BEST_FIT_CHARS: u32 = 0x400;
+/// `CP_UTF8` (the ANSI code page when "Use Unicode UTF-8 for worldwide language
+/// support" is enabled).
+pub const CP_UTF8: u32 = 65001;
+/// `WC_ERR_INVALID_CHARS` (the only flag `WideCharToMultiByte` accepts for UTF-8).
+pub const WC_ERR_INVALID_CHARS: u32 = 0x80;
 
 /// `KeyNameInformation` (`KEY_INFORMATION_CLASS`).
 pub const KEY_NAME_INFORMATION: u32 = 3;
@@ -268,6 +275,8 @@ extern "system" {
     pub fn VirtualProtect(addr: *mut c_void, size: usize, new: u32, old: *mut u32) -> BOOL;
     pub fn GetEnvironmentVariableW(name: *const u16, buf: *mut u16, size: u32) -> u32;
     pub fn GetCurrentProcessId() -> u32;
+    pub fn GetCurrentThreadId() -> u32;
+    pub fn GetACP() -> u32;
     pub fn GetLastError() -> u32;
     pub fn SetLastError(err: u32);
     pub fn GetTickCount() -> u32;

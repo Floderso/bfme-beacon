@@ -22,6 +22,18 @@ pub unsafe fn load_fn<F: Copy>(slot: &AtomicUsize) -> Option<F> {
     (v != 0).then(|| unsafe { core::mem::transmute_copy::<usize, F>(&v) })
 }
 
+/// The function at address `addr` (e.g. the current value of an IAT slot) as `F`,
+/// `None` for a null address.
+///
+/// # Safety
+/// `F` must be the fn-pointer type of the function at `addr`.
+pub unsafe fn fn_from_addr<F: Copy>(addr: usize) -> Option<F> {
+    const { assert!(core::mem::size_of::<F>() == core::mem::size_of::<usize>()) };
+    // SAFETY: `F` is a pointer-sized fn-pointer type of the function at `addr`
+    // (caller contract) and `addr` is non-null.
+    (addr != 0).then(|| unsafe { core::mem::transmute_copy::<usize, F>(&addr) })
+}
+
 /// Why a slot could not be patched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PatchError {

@@ -6,6 +6,7 @@ use core::cell::UnsafeCell;
 use core::ffi::c_char;
 use core::ptr::{addr_of_mut, null_mut};
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use crate::ffi::{self, Hostent, SockAddrIn};
@@ -40,11 +41,23 @@ impl Armed {
 }
 
 static ARMED: OnceLock<Armed> = OnceLock::new();
+/// Set when a mandatory IAT hook turned out to be bypassed (first-`WSAStartup`
+/// re-verification): virtualisation is off for good, every export is passive.
+static DISARMED: AtomicBool = AtomicBool::new(false);
 
-/// The armed state, `None` in passive mode.
+/// The armed state, `None` in passive mode (never armed, or disarmed).
 #[inline]
 pub fn get() -> Option<&'static Armed> {
+    if DISARMED.load(Ordering::Acquire) {
+        return None;
+    }
     ARMED.get()
+}
+
+/// Turns the socket virtualisation off for the rest of the process (fail safe:
+/// the game then sees an empty LAN instead of half-virtualised sockets).
+pub fn disarm() {
+    DISARMED.store(true, Ordering::Release);
 }
 
 /// `BEACON-<last octet of vip>` (NUL-terminated) and its length.
