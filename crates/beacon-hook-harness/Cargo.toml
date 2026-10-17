@@ -1,0 +1,16 @@
+[package]
+name = "beacon-hook-harness"
+description = "32-bit test program for the beacon-hook wsock32.dll proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "beacon-hook-harness"
+path = "src/main.rs"
+
+[dependencies]
+# Frame encode/parse for the fake agent (same allocation-free modules as the hook).
+beacon-proto = { path = "../beacon-proto", default-features = false }

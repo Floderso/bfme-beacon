@@ -1,0 +1,21 @@
+[package]
+name = "beacon-hook"
+description = "BFME Beacon wsock32.dll proxy: socket virtualisation inside lotrbfme.exe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+build = "build.rs"
+
+[lib]
+# The output must be called `wsock32.dll` (it replaces the system wsock32 in the
+# game folder). Build it with `cargo hook` (alias in .cargo/config.toml):
+# i686-pc-windows-gnullvm, profile `release-hook` (panic = abort).
+name = "wsock32"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Only the allocation-free modules (net, env, local, relay); no control channel.
+beacon-proto = { path = "../beacon-proto", default-features = false }

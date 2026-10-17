@@ -1,4 +1,6 @@
 # Machine-specific linker paths live in $CARGO_HOME/config.toml (see docs/dev/build.md).
 [alias]
 hook = "build --profile release-hook -p beacon-hook --target i686-pc-windows-gnullvm"
+# Runs the 32-bit hook harness against the `cargo hook` output (build that first).
+hook-harness = "run -p beacon-hook-harness --target i686-pc-windows-gnullvm --"
 server-linux = "build --release -p beacon-server --target x86_64-unknown-linux-musl"
