@@ -510,16 +510,22 @@ impl Hub {
         self.publish_lobby_locked(&st);
     }
 
-    /// Updates game state and the agent's relay measurements.
+    /// Updates game state and the agent's relay measurements. A change of
+    /// `in_game` is published at once; new measurements (which launchers report
+    /// continuously) go out with the periodic lobby refresh, so that N players
+    /// reporting every second do not cause N² full lobby messages per second.
     pub fn set_status(&self, id: u64, in_game: bool, rtt_ms: Option<u32>, loss_pct: Option<u8>) {
         let mut st = lock(&self.state);
         let Some(m) = st.lobby.member_mut(id) else {
             return;
         };
+        let state_changed = m.in_game != in_game;
         m.in_game = in_game;
         m.reported_rtt_ms = rtt_ms.map(|r| r.min(MAX_REPORTED_RTT_MS));
         m.reported_loss_pct = loss_pct.map(|l| l.min(100));
-        self.publish_lobby_locked(&st);
+        if state_changed {
+            self.publish_lobby_locked(&st);
+        }
     }
 
     /// Stores a player's fingerprint file list; a complete list also updates the

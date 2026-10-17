@@ -426,10 +426,14 @@ async fn map_scanner(
     every: Option<Duration>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut ticker = every.map(|d| {
-        let mut i = tokio::time::interval_at(Instant::now() + d, d);
+    let mut ticker = every.and_then(|d| {
+        let Some(first) = Instant::now().checked_add(d) else {
+            warn!("map rescan interval too long; periodic rescans disabled");
+            return None;
+        };
+        let mut i = tokio::time::interval_at(first, d);
         i.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        i
+        Some(i)
     });
     loop {
         tokio::select! {
@@ -567,6 +571,26 @@ mod tests {
         assert!(load_vips(&path).is_empty());
         assert!(load_vips(&dir.join("missing.json")).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Regression: `Instant::now() + map_rescan` panicked for a huge interval and
+    // took the whole server down (supervised task ended).
+    #[tokio::test]
+    async fn map_scanner_survives_a_huge_interval() {
+        let (maps_tx, _maps_rx) = watch::channel(Arc::new(MapRepo::default()));
+        let (_rescan_tx, rescan_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(map_scanner(
+            PathBuf::from("beacon-test-no-such-dir"),
+            HashCache::default(),
+            maps_tx,
+            rescan_rx,
+            Some(Duration::MAX),
+            shutdown_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(true).unwrap();
+        task.await.expect("map scanner must not panic");
     }
 
     #[tokio::test]

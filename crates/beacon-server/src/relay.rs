@@ -13,7 +13,8 @@
 //! after [`REDUNDANCY_DELAYS`]); the receiver's replay window drops the copies.
 //!
 //! Every datagram that fails before authentication (malformed, unknown session,
-//! bad tag) is charged to its source IP; an IP over budget is ignored unparsed.
+//! bad tag) is charged to its source IP; datagrams from an IP over budget are
+//! ignored, except from the endpoint a session last authenticated from.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -607,11 +608,22 @@ impl Relay {
         let len = packet.len() as u64;
         self.totals.rx_datagrams = self.totals.rx_datagrams.saturating_add(1);
         self.totals.rx_bytes = self.totals.rx_bytes.saturating_add(len);
-        if !self.preauth.allowed(canonical_ip(src.ip()), now.into_std()) {
+        // Parsing the 24-byte header is as cheap as the budget lookup. A datagram
+        // from the endpoint a session last authenticated from is never dropped by
+        // the per-IP budget: junk with a spoofed source IP, or a stale agent behind
+        // the same NAT, must not black-hole a player's game traffic. Its tag is
+        // still checked below; failures are still charged.
+        let peeked = wire::peek_header(packet);
+        let known_endpoint = peeked.as_ref().is_ok_and(|h| {
+            self.sessions
+                .get(&h.session)
+                .is_some_and(|s| s.endpoint == Some(src))
+        });
+        if !known_endpoint && !self.preauth.allowed(canonical_ip(src.ip()), now.into_std()) {
             self.totals.preauth_dropped = self.totals.preauth_dropped.saturating_add(1);
             return;
         }
-        let Ok(header) = wire::peek_header(packet) else {
+        let Ok(header) = peeked else {
             self.reject(src, now, |t| &mut t.malformed);
             return;
         };

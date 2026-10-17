@@ -10,22 +10,27 @@ Home server of BFME Beacon (contract: `docs/dev/architecture.md` §6, §7, §8 m
   (sanitised, rate limited, last 20 lines replayed), `launch_all`, `kick` (with a
   rejoin ban), fingerprint lists, map list and 32 KiB chunk downloads, ping/pong.
   Timeouts: handshake 10 s, idle 30 s, writes 10 s. Failed handshakes ban the IP
-  with exponential backoff.
+  with exponential backoff. Per-IP limits treat an IPv6 /64 as one address.
 * **Relay (UDP)** – one task owns every session (key, replay window, send counter,
   registered vports, endpoint updated only after a valid tag). Unicast to the
   owner of the destination vIP, broadcast to every other session with that vport,
   never echoed. Each forwarded packet is sealed once per receiver and sent 1–3 times
   (3 ms / 10 ms copies; lobby 3, game 2). Per-session token bucket, per-IP budget
-  for unauthenticated junk, per-session stats (packets, bytes, drops, duplicates,
-  upstream loss from counter gaps).
+  for unauthenticated junk (never applied to a session's authenticated endpoint),
+  per-session stats (packets, bytes, drops, duplicates, upstream loss from counter
+  gaps).
 * **Maps** – `maps_dir/<Map>/<file>` (one sub-folder level), BLAKE3 manifest cached
-  by `(path, size, mtime)`, rescanned on SIGHUP and every `map_rescan_secs`.
+  by `(path, size, mtime)`, rescanned on SIGHUP and every `map_rescan_secs`. Every
+  open (hashing, serving) re-checks that the file still resolves to its place
+  inside the repository: links, junctions or FIFOs swapped in later are refused.
 * **Status** – `GET /health` (`ok`, 503 if the relay loop stalls) and
   `GET /status` (JSON) on `status_bind` (default `127.0.0.1:28087`).
 * **Webhook** – optional plain-HTTP POST per event (ntfy format: body + `Title`).
 
 Lobby `rtt_ms` is the agent's measurement (relay PING/PONG, reported via `status`);
 `loss_pct` combines the agent-reported loss with the server-measured upstream loss.
+Measurements are published with the periodic lobby refresh (every 2 s); state
+changes (join/leave, host, ready, in_game, fingerprint) go out at once.
 
 ## Usage
 

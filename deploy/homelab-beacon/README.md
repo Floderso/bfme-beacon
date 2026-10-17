@@ -42,7 +42,9 @@ chmod 600 config.toml   # enthält nach dem Passwort-Setzen den Zugangsschlüsse
 ```
 
 Hat dein Benutzer nicht die UID 1000, muss der Container die Datei trotzdem
-lesen können: `sudo chown 1000:1001 config.toml`.
+lesen können: `sudo chown 1000:1001 config.toml`. `set-password` (Abschnitt 2)
+dann mit `sudo` aufrufen (`… | sudo ./beacon-server set-password …`); Besitzer
+und Rechte der Datei bleiben dabei erhalten.
 
 In `config.toml` mindestens `server_name` und `motd` anpassen, optional
 `admin_names` (diese Spieler sind immer Host).

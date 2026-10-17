@@ -227,9 +227,24 @@ impl LimitsConfig {
         if self.max_pending_handshakes == 0 {
             return Err(invalid("limits.max_pending_handshakes must be at least 1"));
         }
+        for (name, secs, max) in [
+            ("kick_ban_secs", self.kick_ban_secs, MAX_KICK_BAN_SECS),
+            ("handshake_ban_secs", self.handshake_ban_secs, MAX_HANDSHAKE_BAN_SECS),
+        ] {
+            if secs > max {
+                return Err(invalid(format!("limits.{name} must be at most {max}")));
+            }
+        }
         Ok(())
     }
 }
+
+/// Upper bound of `limits.kick_ban_secs` (30 days).
+pub const MAX_KICK_BAN_SECS: u64 = 30 * 24 * 3600;
+/// Upper bound of `limits.handshake_ban_secs` (1 day).
+pub const MAX_HANDSHAKE_BAN_SECS: u64 = 24 * 3600;
+/// Upper bound of `map_rescan_secs` (1 day).
+pub const MAX_MAP_RESCAN_SECS: u64 = 24 * 3600;
 
 /// The Noise PSK; `Debug` does not print it.
 #[derive(Clone, PartialEq, Eq)]
@@ -282,7 +297,8 @@ pub struct Settings {
     pub handshake_timeout: Duration,
     /// A session that sends nothing for this long is dropped.
     pub idle_timeout: Duration,
-    /// How often the lobby is re-published with fresh relay statistics.
+    /// How often the lobby is re-published with fresh relay statistics and the
+    /// RTT/loss values the players reported meanwhile.
     pub lobby_refresh: Duration,
 }
 
@@ -410,6 +426,11 @@ impl Config {
             }
         }
         self.limits.validate()?;
+        if self.map_rescan_secs > MAX_MAP_RESCAN_SECS {
+            return Err(invalid(format!(
+                "map_rescan_secs must be at most {MAX_MAP_RESCAN_SECS} (0 = off)"
+            )));
+        }
         if self.maps_dir.trim().is_empty() {
             return Err(invalid("maps_dir must not be empty"));
         }
@@ -809,8 +830,9 @@ fn update_top_level_keys(text: &str, pairs: &[(&str, &str)]) -> String {
 }
 
 /// Replaces the file at `path` with `data`: written to a temporary file next to
-/// it (same permissions) and renamed over it; if that is impossible (e.g. a
-/// single-file Docker bind mount), the file is overwritten in place.
+/// it (same permissions and, on Unix, same owner where allowed) and renamed over
+/// it; if that is impossible (e.g. a single-file Docker bind mount), the file is
+/// overwritten in place.
 pub fn write_file_replacing(path: &Path, data: &[u8]) -> io::Result<()> {
     let mut tmp_name = path
         .file_name()
@@ -818,8 +840,8 @@ pub fn write_file_replacing(path: &Path, data: &[u8]) -> io::Result<()> {
         .unwrap_or_else(|| "config.toml".into());
     tmp_name.push(format!(".tmp-{}", std::process::id()));
     let tmp = path.with_file_name(tmp_name);
-    let perms = fs::metadata(path).ok().map(|m| m.permissions());
-    match write_and_rename(path, &tmp, data, perms) {
+    let original = fs::metadata(path).ok();
+    match write_and_rename(path, &tmp, data, original.as_ref()) {
         Ok(()) => Ok(()),
         Err(_) => {
             let _ = fs::remove_file(&tmp);
@@ -837,7 +859,7 @@ fn write_and_rename(
     path: &Path,
     tmp: &Path,
     data: &[u8],
-    perms: Option<fs::Permissions>,
+    original: Option<&fs::Metadata>,
 ) -> io::Result<()> {
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -850,8 +872,17 @@ fn write_and_rename(
     file.write_all(data)?;
     file.sync_all()?;
     drop(file);
-    if let Some(p) = perms {
-        fs::set_permissions(tmp, p)?;
+    if let Some(meta) = original {
+        // Owner first: chown may clear set-id bits that the mode then restores.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // Succeeds for root (e.g. `sudo beacon-server set-password` on a file
+            // owned by the container user) and is a no-op for the owner itself;
+            // a failure only means the file gets the writer's owner as before.
+            let _ = std::os::unix::fs::chown(tmp, Some(meta.uid()), Some(meta.gid()));
+        }
+        fs::set_permissions(tmp, meta.permissions())?;
     }
     fs::rename(tmp, path)
 }
@@ -959,12 +990,25 @@ mod tests {
             "[limits]\nchat_max_len = 0\n",
             "[kdf]\nm = 1024\nt = 2\np = 1\n",
             "[webhook]\nurl = \"https://ntfy.sh/x\"\n",
+            // Regression: durations this long overflowed `Instant + Duration`
+            // (a panic at the first kick, failed login or map rescan tick).
+            "map_rescan_secs = 9000000000000000000\n",
+            "[limits]\nkick_ban_secs = 9000000000000000000\n",
+            "[limits]\nhandshake_ban_secs = 9000000000000000000\n",
+            "[limits]\nkick_ban_secs = 2592001\n",
+            "[limits]\nhandshake_ban_secs = 86401\n",
+            "map_rescan_secs = 86401\n",
         ];
         for case in cases {
             let text = format!("{base}{case}");
             let result = Config::from_toml(&text).and_then(|c| c.into_settings(Path::new(".")));
             assert!(result.is_err(), "accepted: {case}");
         }
+        // The longest accepted durations.
+        let text = format!(
+            "{base}map_rescan_secs = 86400\n[limits]\nkick_ban_secs = 2592000\nhandshake_ban_secs = 86400\n"
+        );
+        assert!(Config::from_toml(&text).unwrap().into_settings(Path::new(".")).is_ok());
         // Bad secrets.
         for (salt, psk) in [("abc", PSK_HEX), (SALT_HEX, "zz"), ("", PSK_HEX), (SALT_HEX, "")] {
             let text = format!("salt = \"{salt}\"\npsk = \"{psk}\"\n");
@@ -1057,6 +1101,33 @@ mod tests {
         assert_eq!(changed.len(), 2);
         assert!(set_password_file(&path, "short").is_err());
         assert!(set_password_file(&dir.join("missing.toml"), "long enough").is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Regression: the replacement got the owner of whoever ran set-password, so
+    // `sudo beacon-server set-password` left a root-owned 0600 config that the
+    // container user (1000:1001) cannot read: the server never started again.
+    // Meaningful when the test runs as root; otherwise it checks that the owner
+    // and mode stay the same.
+    #[cfg(unix)]
+    #[test]
+    fn replacing_keeps_owner_and_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("beacon-cfg-owner-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        if fs::metadata(&path).unwrap().uid() == 0 {
+            std::os::unix::fs::chown(&path, Some(4321), Some(4321)).unwrap();
+        }
+        let before = fs::metadata(&path).unwrap();
+        write_file_replacing(&path, b"new").unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(after.mode() & 0o777, 0o640);
+        assert_eq!(fs::read(&path).unwrap(), b"new");
         fs::remove_dir_all(&dir).unwrap();
     }
 

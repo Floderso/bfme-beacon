@@ -3,13 +3,22 @@
 //! limiter. All tables are bounded.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
-/// Canonical form of a peer address for per-IP bookkeeping: IPv4-mapped IPv6
-/// addresses (`::ffff:a.b.c.d`, seen on dual-stack sockets) become plain IPv4.
+/// Key of a peer address for per-IP bookkeeping: IPv4-mapped IPv6 addresses
+/// (`::ffff:a.b.c.d`, seen on dual-stack sockets) become plain IPv4, and IPv6
+/// addresses are reduced to their /64 prefix. One subscriber owns at least a
+/// whole /64, so per-address limits and bans would be evaded by rotating
+/// addresses; this way a /64 counts like one IPv4 address behind NAT.
 pub fn canonical_ip(ip: IpAddr) -> IpAddr {
-    ip.to_canonical()
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let [a, b, c, d, ..] = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))
+        }
+        v4 @ IpAddr::V4(_) => v4,
+    }
 }
 
 /// Classic token bucket: `rate` tokens per second, at most `burst` tokens.
@@ -241,7 +250,11 @@ impl HandshakeGuard {
         }
         let factor = 1u32.checked_shl(entry.ban_level.min(16)).unwrap_or(u32::MAX);
         let ban = cfg.ban.saturating_mul(factor).min(cfg.max_ban);
-        entry.banned_until = Some(now + ban);
+        // A ban too long to represent lasts "very long" instead of panicking.
+        entry.banned_until = now
+            .checked_add(ban)
+            .or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 24 * 3600)))
+            .or(Some(now));
         entry.ban_level = entry.ban_level.saturating_add(1);
         entry.failures = 0;
         self.bans_total = self.bans_total.saturating_add(1);
@@ -464,6 +477,25 @@ mod tests {
         assert_eq!(g.bans_total(), 2);
     }
 
+    // Regression: `now + ban` panicked for very long bans.
+    #[test]
+    fn huge_ban_does_not_panic() {
+        let mut g = HandshakeGuard::new(GuardConfig {
+            max_failures: 1,
+            ban: Duration::MAX,
+            max_ban: Duration::MAX,
+            ..GuardConfig::default()
+        });
+        let t = Instant::now();
+        g.admit(ip(1), t).unwrap();
+        assert!(g.handshake_done(ip(1), false, t).is_some());
+        g.disconnected(ip(1), false, t);
+        assert!(matches!(
+            g.admit(ip(1), t + Duration::from_secs(3600)),
+            Err(Denied::Banned { .. })
+        ));
+    }
+
     #[test]
     fn guard_limits_connections_and_pending() {
         let cfg = GuardConfig {
@@ -528,7 +560,37 @@ mod tests {
     fn canonical_maps_v4_in_v6() {
         let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
         assert_eq!(canonical_ip(mapped), "192.0.2.1".parse::<IpAddr>().unwrap());
-        let v6: IpAddr = "2001:db8::1".parse().unwrap();
-        assert_eq!(canonical_ip(v6), v6);
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(canonical_ip(v4), v4);
+    }
+
+    // Regression: IPv6 peers were tracked per /128, so one subscriber (who owns a
+    // whole /64) could rotate addresses to escape bans and per-IP limits, e.g.
+    // to hold every pending-handshake slot.
+    #[test]
+    fn ipv6_is_accounted_per_64_prefix() {
+        let v6 = |s: &str| canonical_ip(s.parse::<IpAddr>().unwrap());
+        assert_eq!(v6("2001:db8:1:2::1"), v6("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_eq!(v6("2001:db8:1:2:abcd::9"), "2001:db8:1:2::".parse::<IpAddr>().unwrap());
+        assert_ne!(v6("2001:db8:1:2::1"), v6("2001:db8:1:3::1"));
+        let mut g = HandshakeGuard::new(GuardConfig {
+            max_failures: 2,
+            max_pending_per_ip: 3,
+            ..GuardConfig::default()
+        });
+        let t = Instant::now();
+        // Pending handshakes from many addresses of one /64 share one budget.
+        for n in 1..=3u16 {
+            g.admit(v6(&format!("2001:db8:1:2::{n:x}")), t).unwrap();
+        }
+        assert_eq!(g.admit(v6("2001:db8:1:2::99"), t), Err(Denied::TooManyPending));
+        for n in 1..=3u16 {
+            let ip = v6(&format!("2001:db8:1:2::{n:x}"));
+            g.handshake_done(ip, false, t);
+            g.disconnected(ip, false, t);
+        }
+        // The ban covers the whole /64, not only the addresses that failed.
+        assert!(matches!(g.admit(v6("2001:db8:1:2:dead::1"), t), Err(Denied::Banned { .. })));
+        assert!(g.admit(v6("2001:db8:1:3::1"), t).is_ok());
     }
 }

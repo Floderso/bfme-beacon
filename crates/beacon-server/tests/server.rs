@@ -637,6 +637,54 @@ async fn lobby_updates_ready_status_and_host_transfer() {
     srv.shutdown().await;
 }
 
+// Regression: every `status` with a new RTT/loss value was pushed to every
+// player at once as a full lobby list. With launchers reporting each second that
+// is N² lobby messages per second on the home server's uplink (16 players:
+// ~0.8 MB/s, far more than the game traffic). Measurements now ride on the
+// periodic lobby refresh; state changes (in_game, ready, …) stay immediate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rtt_reports_do_not_flood_the_lobby() {
+    let mut srv = TestServer::start_with(|s| s.lobby_refresh = Duration::from_millis(1500)).await;
+    let mut a = srv.login("Frodo").await;
+    let mut b = srv.login("Sam").await;
+    a.expect_lobby("Sam joined", |p| p.len() == 2).await;
+    // Ten reports, spread out like real ones (a burst would be coalesced).
+    let sam_rtt = |p: &[Player]| p.iter().find(|x| x.name == "Sam").and_then(|x| x.rtt_ms);
+    let mut lobbies = 0;
+    let mut last_rtt = None;
+    for rtt in 1..=10u32 {
+        b.send(&ClientMsg::Status {
+            in_game: false,
+            rtt_ms: Some(rtt),
+            loss_pct: None,
+        })
+        .await;
+        let until = Instant::now() + Duration::from_millis(60);
+        while let Some(msg) = a.recv_within(until.saturating_duration_since(Instant::now())).await {
+            if let ServerMsg::Lobby { players } = msg {
+                lobbies += 1;
+                last_rtt = sam_rtt(&players);
+            }
+        }
+    }
+    assert!(lobbies <= 2, "{lobbies} lobby messages for 10 RTT reports (expected at most 2)");
+    // The latest value is shown with the next refresh.
+    if last_rtt != Some(10) {
+        a.expect_lobby("rtt 10", |p| sam_rtt(p) == Some(10)).await;
+    }
+    // A state change is still sent at once.
+    b.send(&ClientMsg::Status {
+        in_game: true,
+        rtt_ms: Some(31),
+        loss_pct: None,
+    })
+    .await;
+    let t0 = Instant::now();
+    a.expect_lobby("in game", |p| p.iter().any(|x| x.name == "Sam" && x.in_game)).await;
+    assert!(t0.elapsed() < Duration::from_millis(1000), "in_game must not wait for the refresh");
+    srv.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_is_broadcast_sanitised_limited_and_replayed() {
     let mut srv = TestServer::start().await;
@@ -823,6 +871,35 @@ async fn idle_and_silent_connections_are_dropped() {
     .await
     .unwrap();
     assert!(closed && total > 0, "hello line, then closed");
+    srv.shutdown().await;
+}
+
+// Regression: frames that decrypt but hold no valid message bypassed the
+// per-connection rate limit, and each one was answered with an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_messages_count_against_the_rate_limit() {
+    let mut srv = TestServer::start_with(|s| {
+        s.limits.control_msgs_per_s = 1;
+        s.limits.control_burst = 5;
+    })
+    .await;
+    let mut a = srv.login("Frodo").await;
+    let mut wire = Vec::new();
+    let mut buf = vec![0u8; NOISE_MAX_MSG_LEN];
+    for _ in 0..400 {
+        let n = a.transport.write_message(b"{not json", &mut buf).unwrap();
+        encode_frame(&buf[..n], &mut wire).unwrap();
+    }
+    a.stream.write_all(&wire).await.unwrap();
+    // Answers within the budget, then the connection is closed like for any
+    // other client that keeps exceeding the limit.
+    let mut bad_requests = 0;
+    while let Some(msg) = a.recv_within(T).await {
+        if matches!(msg, ServerMsg::Error { code: ErrorCode::BadRequest, .. }) {
+            bad_requests += 1;
+        }
+    }
+    assert!(bad_requests <= 10, "{bad_requests} answers to 400 invalid frames");
     srv.shutdown().await;
 }
 
@@ -1088,6 +1165,44 @@ async fn spoofed_sources_are_rejected_and_endpoints_follow_authenticated_packets
 
     srv.status_until("3 auth failures", |s| s["relay"]["auth_failed"].as_u64().unwrap() >= 3)
         .await;
+    srv.shutdown().await;
+}
+
+// Regression: the per-IP pre-authentication budget used to be checked before
+// anything else, so junk with a player's source IP (spoofed, or a stale agent
+// behind the same NAT) black-holed that player's authenticated game traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn junk_from_a_players_ip_does_not_block_its_authenticated_endpoint() {
+    let mut srv = TestServer::start_with(|s| {
+        s.limits.preauth_pps = 1;
+        s.limits.preauth_burst = 2;
+    })
+    .await;
+    let mut a = srv.login("Frodo").await;
+    let mut b = srv.login("Sam").await;
+    a.reg(8086).await;
+    b.reg(8086).await;
+    // Junk from the same IP (127.0.0.1, another port), all the time.
+    let relay_addr = srv.srv().relay_addr();
+    let junk = tokio::spawn(async move {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        loop {
+            let _ = s.send_to(&[0x5A; 64], relay_addr).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    srv.status_until("IP over budget", |s| {
+        s["relay_blocked_ips"].as_u64().unwrap() >= 1 && s["relay"]["preauth_dropped"].as_u64().unwrap() >= 10
+    })
+    .await;
+    // The players' authenticated endpoints keep working in both directions.
+    for i in 0..3u8 {
+        a.data(b.vip, 8086, 8086, &[i]).await;
+        assert_eq!(b.recv_data(T).await.expect("Frodo not black-holed").1, [i]);
+        b.data(a.vip, 8086, 8086, &[i, i]).await;
+        assert_eq!(a.recv_data(T).await.expect("Sam not black-holed").1, [i, i]);
+    }
+    junk.abort();
     srv.shutdown().await;
 }
 

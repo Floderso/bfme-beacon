@@ -129,6 +129,7 @@ dependencies = [
  "axum",
  "beacon-proto",
  "getrandom",
+ "libc",
  "serde",
  "serde_json",
  "socket2",

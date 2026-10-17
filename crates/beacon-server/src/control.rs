@@ -279,6 +279,31 @@ impl Limiter {
             strikes: 0,
         }
     }
+
+    /// Charges one received frame (valid or not) to its bucket: `None` if it may
+    /// be handled, otherwise what to do instead (the first refusal in a row is
+    /// answered with `rate_limited`; too many in a row close the connection).
+    async fn charge(&mut self, conn: &mut Conn, map_chunk: bool) -> Result<Option<Flow>, ConnError> {
+        let now = std::time::Instant::now();
+        let allowed = if map_chunk {
+            self.chunks.try_take(now)
+        } else {
+            self.general.try_take(now)
+        };
+        if allowed {
+            self.strikes = 0;
+            return Ok(None);
+        }
+        self.strikes = self.strikes.saturating_add(1);
+        if self.strikes > MAX_STRIKES {
+            debug!("closing a connection that keeps exceeding the rate limit");
+            return Ok(Some(Flow::Close));
+        }
+        if self.strikes == 1 {
+            conn.send_error(ErrorCode::RateLimited, "Zu viele Anfragen.").await?;
+        }
+        Ok(Some(Flow::Continue))
+    }
 }
 
 enum Flow {
@@ -398,12 +423,16 @@ async fn handle_connection(
                     idle.as_mut().reset(Instant::now() + idle_timeout);
                     let flow = match incoming {
                         Incoming::Msg(msg) => handle_msg(&hub, &mut conn, id, msg, &mut limiter).await,
-                        Incoming::Invalid(e) => {
-                            debug!(%peer, "invalid message: {e}");
-                            conn.send_error(ErrorCode::BadRequest, "Ungültige Nachricht.")
-                                .await
-                                .map(|()| Flow::Continue)
-                        }
+                        Incoming::Invalid(e) => match limiter.charge(&mut conn, false).await {
+                            Ok(None) => {
+                                debug!(%peer, "invalid message: {e}");
+                                conn.send_error(ErrorCode::BadRequest, "Ungültige Nachricht.")
+                                    .await
+                                    .map(|()| Flow::Continue)
+                            }
+                            Ok(Some(flow)) => Ok(flow),
+                            Err(e) => Err(e),
+                        },
                     };
                     match flow {
                         Ok(Flow::Continue) => {}
@@ -484,24 +513,13 @@ async fn handle_msg(
     msg: ClientMsg,
     limiter: &mut Limiter,
 ) -> Result<Flow, ConnError> {
-    let now = std::time::Instant::now();
-    let allowed = if matches!(msg, ClientMsg::MapGet { .. }) {
-        limiter.chunks.try_take(now)
-    } else {
-        limiter.general.try_take(now)
-    };
-    if !allowed {
-        limiter.strikes = limiter.strikes.saturating_add(1);
-        if limiter.strikes > MAX_STRIKES {
-            debug!("closing a connection that keeps exceeding the rate limit");
-            return Ok(Flow::Close);
-        }
-        if limiter.strikes == 1 {
-            conn.send_error(ErrorCode::RateLimited, "Zu viele Anfragen.").await?;
-        }
-        return Ok(Flow::Continue);
+    if let Some(flow) = limiter
+        .charge(conn, matches!(msg, ClientMsg::MapGet { .. }))
+        .await?
+    {
+        return Ok(flow);
     }
-    limiter.strikes = 0;
+    let now = std::time::Instant::now();
     let result: Result<(), (ErrorCode, String)> = match msg {
         ClientMsg::Hello { .. } => Err((ErrorCode::BadRequest, "Bereits angemeldet.".to_owned())),
         ClientMsg::FingerprintFiles { files, complete } => {

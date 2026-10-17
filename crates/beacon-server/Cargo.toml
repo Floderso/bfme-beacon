@@ -41,5 +41,10 @@ getrandom = "0.3.4"
 # Dual-stack bind ("[::]") and socket buffer sizes.
 socket2 = "0.6"
 
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW / O_NONBLOCK / ELOOP for opening map files safely (constants only;
+# already in the dependency graph through tokio, socket2 and getrandom).
+libc = "0.2"
+
 [lints.rust]
 unsafe_code = "forbid"

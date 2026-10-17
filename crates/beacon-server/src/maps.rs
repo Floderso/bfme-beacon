@@ -4,8 +4,10 @@
 //! Only names passing [`is_safe_file_name`] are listed; symbolic links, hidden
 //! files and case-insensitive duplicates (which would collide on Windows) are
 //! skipped. Chunks are served only for files in the current manifest, so a request
-//! can never name a path outside the repository. Hashes are cached by
-//! `(path, size, mtime)` across rescans.
+//! can never name a path outside the repository, and every open (hashing or
+//! serving) checks that the path still resolves to that file below the canonical
+//! repository root: links swapped in after a scan are refused. Hashes are cached
+//! by `(path, size, mtime)` across rescans.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -135,17 +137,77 @@ impl HashCache {
 
 /// Streams a file through BLAKE3.
 pub fn hash_file(path: &Path) -> io::Result<String> {
-    let mut file = fs::File::open(path)?;
+    hash_reader(&mut fs::File::open(path)?)
+}
+
+/// Streams everything `reader` yields through BLAKE3.
+pub fn hash_reader(reader: &mut impl Read) -> io::Result<String> {
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; HASH_BUF];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(buf.get(..n).unwrap_or_default());
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// `true` for the error of opening a symbolic link with `O_NOFOLLOW`.
+fn is_link_refusal(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// Opens the repository file at `path` for reading, provided it really is the
+/// regular file at `expected` (its canonical location inside the repository).
+/// `Ok(None)` if anything else is there now: a symbolic link or junction in any
+/// component (swapped in after the scan), a FIFO or device. The last component
+/// is opened without following links and without blocking (FIFOs), then the
+/// whole path must still resolve to `expected` and, on Unix, to the very file
+/// that was opened (same device and inode), so a link swapped in and out again
+/// between the steps is detected as well.
+fn open_repo_file(path: &Path, expected: &Path) -> io::Result<Option<(fs::File, fs::Metadata)>> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        /// Opens a link or junction itself instead of its target.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) if is_link_refusal(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() || fs::canonicalize(path)? != expected {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let at_expected = fs::symlink_metadata(expected)?;
+        if (at_expected.dev(), at_expected.ino()) != (meta.dev(), meta.ino()) {
+            return Ok(None);
+        }
+    }
+    Ok(Some((file, meta)))
 }
 
 /// Lists `dir` sorted by name; each entry with its file type (links not followed).
@@ -188,6 +250,16 @@ pub fn scan(dir: &Path, cache: &mut HashCache) -> MapRepo {
             return MapRepo::from_maps(Vec::new(), 0, Some(SystemTime::now()));
         }
     };
+    // Every file must resolve to its place below the canonical repository root
+    // (no links anywhere on the way), see `open_repo_file`.
+    let root = match fs::canonicalize(dir) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("cannot resolve maps_dir {}: {e}", dir.display());
+            cache.entries.clear();
+            return MapRepo::from_maps(Vec::new(), 0, Some(SystemTime::now()));
+        }
+    };
     let mut names = HashSet::new();
     for (name, path, file_type) in entries {
         if !file_type.is_dir() {
@@ -206,7 +278,7 @@ pub fn scan(dir: &Path, cache: &mut HashCache) -> MapRepo {
             skipped += 1;
             continue;
         }
-        let files = scan_map(&path, cache, &mut seen_paths, &mut skipped);
+        let files = scan_map(&path, &root.join(&name), cache, &mut seen_paths, &mut skipped);
         if files.is_empty() {
             debug!("skipping empty map folder {}", path.display());
             continue;
@@ -225,16 +297,19 @@ pub fn scan(dir: &Path, cache: &mut HashCache) -> MapRepo {
     repo
 }
 
+/// Lists one map folder; `canonical_dir` is where `map_dir` must resolve to.
 fn scan_map(
     map_dir: &Path,
+    canonical_dir: &Path,
     cache: &mut HashCache,
     seen_paths: &mut HashSet<PathBuf>,
     skipped: &mut usize,
 ) -> Vec<MapFile> {
     let mut files = Vec::new();
     let mut keys = HashSet::new();
-    let mut stack: Vec<(PathBuf, String)> = vec![(map_dir.to_path_buf(), String::new())];
-    while let Some((dir, prefix)) = stack.pop() {
+    let mut stack: Vec<(PathBuf, PathBuf, String)> =
+        vec![(map_dir.to_path_buf(), canonical_dir.to_path_buf(), String::new())];
+    while let Some((dir, canonical, prefix)) = stack.pop() {
         let entries = match sorted_entries(&dir) {
             Ok(e) => e,
             Err(e) => {
@@ -256,9 +331,10 @@ fn scan_map(
             } else {
                 format!("{prefix}/{name}")
             };
+            let expected = canonical.join(&name);
             if file_type.is_dir() {
                 if prefix.is_empty() {
-                    stack.push((path, rel));
+                    stack.push((path, expected, rel));
                 } else {
                     warn!("skipping {:?} (maps may have one sub-folder level)", path);
                     *skipped += 1;
@@ -276,7 +352,7 @@ fn scan_map(
                 *skipped += 1;
                 continue;
             }
-            match file_entry(&path, &rel, cache) {
+            match file_entry(&path, &expected, &rel, cache) {
                 Ok(Some(f)) => {
                     seen_paths.insert(path);
                     files.push(f);
@@ -293,11 +369,11 @@ fn scan_map(
     files
 }
 
-fn file_entry(path: &Path, rel: &str, cache: &mut HashCache) -> io::Result<Option<MapFile>> {
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.is_file() {
+fn file_entry(path: &Path, expected: &Path, rel: &str, cache: &mut HashCache) -> io::Result<Option<MapFile>> {
+    let Some((mut file, meta)) = open_repo_file(path, expected)? else {
+        warn!("skipping {} (not a regular file inside the repository)", path.display());
         return Ok(None);
-    }
+    };
     let size = meta.len();
     if size > MAX_FILE_SIZE {
         warn!("skipping {} (larger than 1 GiB)", path.display());
@@ -311,7 +387,7 @@ fn file_entry(path: &Path, rel: &str, cache: &mut HashCache) -> io::Result<Optio
     let blake3_hex = match cached {
         Some(c) => c.blake3_hex.clone(),
         None => {
-            let hex = hash_file(path)?;
+            let hex = hash_reader(&mut file)?;
             cache.entries.insert(
                 path.to_path_buf(),
                 CachedHash {
@@ -366,17 +442,29 @@ pub fn read_chunk(
     if !is_safe_file_name(map) || !is_safe_rel_path(&file.path) {
         return Err(ChunkError::Changed);
     }
+    let not_found_is_changed = |e: io::Error| {
+        if e.kind() == io::ErrorKind::NotFound {
+            ChunkError::Changed
+        } else {
+            ChunkError::Io(e)
+        }
+    };
     let mut path = maps_dir.join(map);
+    let mut expected = fs::canonicalize(maps_dir)
+        .map_err(not_found_is_changed)?
+        .join(map);
     for part in file.path.split('/') {
         path.push(part);
+        expected.push(part);
     }
-    let meta = fs::symlink_metadata(&path).map_err(ChunkError::Io)?;
-    if !meta.is_file() || meta.len() != file.size {
+    let (mut f, meta) = open_repo_file(&path, &expected)
+        .map_err(not_found_is_changed)?
+        .ok_or(ChunkError::Changed)?;
+    if meta.len() != file.size {
         return Err(ChunkError::Changed);
     }
     let remaining = file.size - offset;
     let len = usize::try_from(remaining.min(CHUNK_MAX as u64)).unwrap_or(CHUNK_MAX);
-    let mut f = fs::File::open(&path).map_err(ChunkError::Io)?;
     f.seek(SeekFrom::Start(offset)).map_err(ChunkError::Io)?;
     let mut data = vec![0u8; len];
     f.read_exact(&mut data).map_err(|e| {
@@ -516,6 +604,94 @@ mod tests {
         };
         assert!(read_chunk(&tmp.0, "M", &evil, 0).is_err());
         assert!(read_chunk(&tmp.0, "..", &f, 0).is_err());
+    }
+
+    /// Makes `link` point to the directory `target`: a symbolic link on Unix, a
+    /// junction on Windows (needs no privileges). `false` if impossible here.
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        }
+    }
+
+    // Regression: `read_chunk` checked only the last path component with
+    // `symlink_metadata` (which follows links in the folders above it) and then
+    // opened the path again. Whoever can write into `maps_dir` could replace a
+    // scanned folder by a link and download any same-sized file the server can
+    // read (e.g. its config with the webhook token).
+    #[test]
+    fn links_swapped_in_after_the_scan_are_not_followed() {
+        let tmp = TempDir::new("escape");
+        let maps = tmp.0.join("maps");
+        write(&maps.join("M/sub/secret.txt"), b"public!");
+        write(&maps.join("M/m.map"), b"map");
+        write(&tmp.0.join("outside/secret.txt"), b"SECRET!");
+        write(&tmp.0.join("outside-map/sub/secret.txt"), b"SECRET!");
+        let repo = scan(&maps, &mut HashCache::default());
+        let entry = repo.file("M", "sub/secret.txt").unwrap().clone();
+        assert_eq!(read_chunk(&maps, "M", &entry, 0).unwrap().0, b"public!");
+
+        // The sub-folder becomes a link to a folder outside the repository.
+        let sub = maps.join("M").join("sub");
+        fs::remove_dir_all(&sub).unwrap();
+        if !link_dir(&tmp.0.join("outside"), &sub) {
+            eprintln!("skipped: cannot create a directory link here");
+            return;
+        }
+        assert!(
+            matches!(read_chunk(&maps, "M", &entry, 0), Err(ChunkError::Changed)),
+            "a file behind a linked folder must not be served"
+        );
+        // A rescan neither lists nor hashes it.
+        let repo2 = scan(&maps, &mut HashCache::default());
+        assert!(repo2.file("M", "sub/secret.txt").is_none());
+        assert!(repo2.file("M", "m.map").is_some());
+
+        // The whole map folder becomes a link.
+        let m_map = repo.file("M", "m.map").unwrap().clone();
+        fs::rename(maps.join("M"), tmp.0.join("old-M")).unwrap();
+        assert!(link_dir(&tmp.0.join("outside-map"), &maps.join("M")));
+        assert!(matches!(read_chunk(&maps, "M", &entry, 0), Err(ChunkError::Changed)));
+        assert!(read_chunk(&maps, "M", &m_map, 0).is_err());
+        assert!(scan(&maps, &mut HashCache::default()).maps.is_empty());
+    }
+
+    // The last component replaced by a symbolic link or a FIFO after the scan
+    // (Windows needs administrator rights for file links).
+    #[cfg(unix)]
+    #[test]
+    fn file_links_and_fifos_swapped_in_after_the_scan_are_refused() {
+        let tmp = TempDir::new("filelink");
+        let maps = tmp.0.join("maps");
+        write(&maps.join("M/a.map"), b"1");
+        write(&maps.join("M/b.map"), b"2");
+        write(&tmp.0.join("outside.txt"), b"S");
+        let repo = scan(&maps, &mut HashCache::default());
+        let a = repo.file("M", "a.map").unwrap().clone();
+        let b = repo.file("M", "b.map").unwrap().clone();
+        fs::remove_file(maps.join("M/a.map")).unwrap();
+        std::os::unix::fs::symlink(tmp.0.join("outside.txt"), maps.join("M/a.map")).unwrap();
+        assert!(matches!(read_chunk(&maps, "M", &a, 0), Err(ChunkError::Changed)));
+        // A FIFO must not block the reader (it would hang a blocking thread).
+        fs::remove_file(maps.join("M/b.map")).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(maps.join("M/b.map"))
+            .status()
+            .is_ok_and(|s| s.success());
+        if made {
+            assert!(matches!(read_chunk(&maps, "M", &b, 0), Err(ChunkError::Changed)));
+            assert!(scan(&maps, &mut HashCache::default()).file("M", "b.map").is_none());
+        }
     }
 
     #[test]

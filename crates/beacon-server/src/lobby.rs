@@ -487,8 +487,15 @@ impl Lobby {
 
     /// Blocks `name` from rejoining for the kick ban duration.
     pub fn ban_name(&mut self, name: &str, now: Instant) {
-        if !self.kick_ban.is_zero() {
-            self.kicked.insert(name_key(name), now + self.kick_ban);
+        if self.kick_ban.is_zero() {
+            return;
+        }
+        // A ban too long to represent lasts "very long" instead of panicking.
+        let until = now
+            .checked_add(self.kick_ban)
+            .or_else(|| now.checked_add(Duration::from_secs(10 * 365 * 24 * 3600)));
+        if let Some(until) = until {
+            self.kicked.insert(name_key(name), until);
         }
     }
 
@@ -697,6 +704,17 @@ mod tests {
             Err(JoinError::Kicked { .. })
         ));
         assert!(l.join(req("Frodo", 2), t + Duration::from_secs(61)).is_ok());
+    }
+
+    // Regression: `now + kick_ban` panicked for very long bans.
+    #[test]
+    fn huge_kick_ban_does_not_panic() {
+        let t = Instant::now();
+        let mut l = Lobby::new(8, &[], Duration::MAX);
+        let a = l.join(req("Frodo", 1), t).unwrap();
+        l.leave(a.id);
+        l.ban_name("Frodo", t);
+        assert!(matches!(l.join(req("frodo", 2), t), Err(JoinError::Kicked { .. })));
     }
 
     #[test]
