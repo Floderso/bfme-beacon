@@ -48,6 +48,15 @@ mod ws2;
 
 use core::ffi::c_void;
 
+/// Identification marker of this DLL: `BFME-BEACON-HOOK/<crate version>` + NUL.
+///
+/// The launcher searches the file for the prefix `BFME-BEACON-HOOK/` before it
+/// replaces a `wsock32.dll` in the game folder: only a DLL containing it is treated
+/// as Beacon's own hook (a foreign `wsock32.dll` is never overwritten). Not exported;
+/// `DllMain` references it so the linker keeps the bytes in the image.
+pub(crate) static BEACON_HOOK_MARKER: &[u8] =
+    concat!("BFME-BEACON-HOOK/", env!("CARGO_PKG_VERSION"), "\0").as_bytes();
+
 /// DLL entry point (called by the mingw CRT's `DllMainCRTStartup`).
 ///
 /// Only `DLL_PROCESS_ATTACH` does work (see `init::process_attach`); it never
@@ -55,7 +64,18 @@ use core::ffi::c_void;
 #[no_mangle]
 pub extern "system" fn DllMain(_module: *mut c_void, reason: u32, _reserved: *mut c_void) -> i32 {
     if reason == ffi::DLL_PROCESS_ATTACH {
+        // Keeps the marker in the image (dead-code elimination would drop it).
+        core::hint::black_box(BEACON_HOOK_MARKER.as_ptr());
         init::process_attach();
     }
     1
+}
+
+#[cfg(test)]
+mod marker_tests {
+    #[test]
+    fn marker_names_the_crate_version() {
+        let text = core::str::from_utf8(super::BEACON_HOOK_MARKER).unwrap();
+        assert_eq!(text, format!("BFME-BEACON-HOOK/{}\0", env!("CARGO_PKG_VERSION")));
+    }
 }

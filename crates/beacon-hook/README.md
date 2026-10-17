@@ -20,6 +20,13 @@ serde). Win32 functions are declared in `src/ffi.rs` and linked from llvm-mingw'
 import libraries; the DLL imports `ws2_32`, `kernel32`, `ntdll`, `msvcrt` and an API
 set (std's futex lock) — never `wsock32` itself and never through the game's IAT.
 
+## Identification marker
+
+The image contains the bytes `BFME-BEACON-HOOK/<crate version>` + NUL
+(`BEACON_HOOK_MARKER`, not exported; `DllMain` references it so the linker keeps
+it). The launcher searches a `wsock32.dll` for this prefix before replacing it and
+never overwrites a `wsock32.dll` without it.
+
 ## Exports
 
 All 75 named exports of `SysWOW64\wsock32.dll` 10.0.26100 with **identical names
@@ -228,7 +235,7 @@ is never logged.
 
 | Path | Content |
 |---|---|
-| `src/lib.rs` | crate root, `DllMain` |
+| `src/lib.rs` | crate root, `DllMain`, `BEACON_HOOK_MARKER` |
 | `src/init.rs` | process attach, IAT patch installation, first-`WSAStartup` report/re-verify |
 | `src/exports.rs` | the 27 exported functions |
 | `src/ws2.rs` | WS2_32 IAT hooks |
