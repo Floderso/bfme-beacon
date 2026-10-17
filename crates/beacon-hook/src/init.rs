@@ -17,7 +17,7 @@ use crate::config::{self, Config, ConfigError, MultiProblem, ProcessEnv};
 use crate::iat::{PatchError, Slot};
 use crate::log::info;
 use crate::pe::{self, Headers, Image, LiveImage, PeError};
-use crate::{ffi, log, multi, reg, state, ws2};
+use crate::{ffi, fw, log, multi, reg, state, ws2};
 
 /// Maximum number of patched slots (5 WS2_32 + 2 registry + 4 test mode).
 const MAX_PATCHES: usize = 11;
@@ -110,6 +110,7 @@ struct Report {
     mutex_w: Optional,
     folder_a: Optional,
     folder_w: Optional,
+    firewall: Optional,
     ansi_userdir: bool,
 }
 
@@ -125,6 +126,7 @@ impl Report {
             mutex_w: Optional::Off,
             folder_a: Optional::Off,
             folder_w: Optional::Off,
+            firewall: Optional::Off,
             ansi_userdir: true,
         }
     }
@@ -184,6 +186,9 @@ pub fn process_attach() {
                 return;
             }
         };
+        // Beacon traffic is loopback only: skip the XP SP2 firewall prompt (fw.rs).
+        let co = fw::hook_co_create_instance as fw::CoCreateInstanceFn as usize;
+        report.firewall = install_optional(img, &headers, &mut list, "ole32.dll", "CoCreateInstance", co, &fw::ORIG_CO_CREATE);
         if let Some(serial) = cfg.serial {
             reg::set_serial(serial);
             let a = reg::hook_reg_query_value_ex_a as reg::RegQueryValueExAFn as usize;
@@ -448,11 +453,12 @@ fn write_report(r: &Report, rv: Reverify) {
     );
     if r.exe_mode {
         info!(
-            "IAT: WS2_32 WSAIoctl/getsockopt/recv/recvfrom/setsockopt patched{}{}; RegQueryValueExA {}, RegQueryValueExW {}",
+            "IAT: WS2_32 WSAIoctl/getsockopt/recv/recvfrom/setsockopt patched{}{}; RegQueryValueExA {}, RegQueryValueExW {}, CoCreateInstance {}",
             if rv.repatched > 0 { " (re-patched after re-snap)" } else { "" },
             if rv.chained > 0 { " (chained behind another module)" } else { "" },
             optional_text(r.reg_a),
-            optional_text(r.reg_w)
+            optional_text(r.reg_w),
+            optional_text(r.firewall)
         );
         if cfg.multi {
             info!(

@@ -34,6 +34,7 @@ mod compat;
 mod config;
 mod exports;
 mod ffi;
+mod fw;
 mod iat;
 mod init;
 mod log;
