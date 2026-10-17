@@ -84,7 +84,7 @@ slot meanwhile:
 
 * a slot that holds the loader's original again is patched again;
 * a WS2_32 slot that holds a third module's function is **probed**: the function is
-  called with a sentinel socket (`ws2::reaches_hook`, `0x7FFFFFF3`, thread-checked;
+  called with a sentinel socket (`ws2::reaches_hook`, `INVALID_SOCKET`, thread-checked;
   ws2_32 answers `WSAENOTSOCK` if the call never reaches us). If our hook is reached
   (the other hook is chained in front of ours) the slot is left alone. If it is
   not, the game would bypass `recvfrom`/`recv` and see raw `DELIVER` frames from

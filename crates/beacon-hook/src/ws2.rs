@@ -30,10 +30,12 @@ pub const SETSOCKOPT: usize = 4;
 /// Original slot values (what the loader resolved), chained to.
 pub static ORIG: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
 
-/// Socket value of a reachability probe (see [`reaches_hook`]). Not a handle any
-/// socket can have (kernel handles are multiples of 4), so ws2_32 answers it with
-/// `WSAENOTSOCK` if a probe never reaches our hook.
-pub const PROBE_SOCKET: SOCKET = 0x7FFF_FFF3;
+/// Socket value of a reachability probe (see [`reaches_hook`]): `INVALID_SOCKET`,
+/// never a socket (ws2_32 answers `WSAENOTSOCK` if a probe never reaches our hook)
+/// and, as a kernel handle, the current-process pseudo-handle, so no call down the
+/// chain can trip an invalid-handle check. A hit also requires the probing thread
+/// and the probed import, so the game's own calls are never mistaken for a probe.
+pub const PROBE_SOCKET: SOCKET = ffi::INVALID_SOCKET;
 /// Thread running a probe (0 = none; no thread has id 0).
 static PROBE_THREAD: AtomicU32 = AtomicU32::new(0);
 /// Index (in [`NAMES`]) of the hook the running probe is looking for.
