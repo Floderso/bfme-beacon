@@ -63,22 +63,40 @@ pub fn set_userdir(dir: WideBuf<PATH_CAP>) -> bool {
     ok
 }
 
+/// `WideCharToMultiByte` flags for the ANSI code page `acp` and whether the
+/// "default character used" report may be requested. With the UTF-8 ANSI code
+/// page ("Use Unicode UTF-8 for worldwide language support") both
+/// `WC_NO_BEST_FIT_CHARS` and `lpUsedDefaultChar` make the call fail
+/// (`ERROR_INVALID_FLAGS`/`ERROR_INVALID_PARAMETER`); there every string is
+/// representable and `WC_ERR_INVALID_CHARS` rejects unpaired surrogates instead.
+const fn ansi_conversion_params(acp: u32) -> (u32, bool) {
+    if acp == ffi::CP_UTF8 {
+        (ffi::WC_ERR_INVALID_CHARS, false)
+    } else {
+        (ffi::WC_NO_BEST_FIT_CHARS, true)
+    }
+}
+
 fn to_ansi(dir: &WideBuf<PATH_CAP>) -> Option<([u8; PATH_CAP], usize)> {
     let mut out = [0u8; PATH_CAP];
     let mut lossy: ffi::BOOL = 0;
     let wide_len = i32::try_from(dir.len()).ok()?;
     let cap = i32::try_from(PATH_CAP - 1).ok()?;
-    // SAFETY: `dir` is valid for `wide_len` units, `out` writable for `cap` bytes.
+    // SAFETY: no arguments.
+    let (flags, report_lossy) = ansi_conversion_params(unsafe { ffi::GetACP() });
+    let used_default: *mut ffi::BOOL = if report_lossy { &mut lossy } else { core::ptr::null_mut() };
+    // SAFETY: `dir` is valid for `wide_len` units, `out` writable for `cap` bytes,
+    // `used_default` is null or points to `lossy`.
     let n = unsafe {
         ffi::WideCharToMultiByte(
             ffi::CP_ACP,
-            ffi::WC_NO_BEST_FIT_CHARS,
+            flags,
             dir.as_ptr(),
             wide_len,
             out.as_mut_ptr(),
             cap,
             core::ptr::null(),
-            &mut lossy,
+            used_default,
         )
     };
     // Same bound as the wide form: the game appends its leaf folder and file
@@ -250,6 +268,16 @@ mod tests {
         assert!(is_appdata(0x801A)); // CSIDL_FLAG_CREATE
         assert!(!is_appdata(0x1C)); // CSIDL_LOCAL_APPDATA
         assert!(!is_appdata(0x05)); // CSIDL_PERSONAL
+    }
+
+    #[test]
+    fn ansi_conversion_flags() {
+        // UTF-8 ANSI code page: no best-fit flag, no used-default report (both
+        // would make WideCharToMultiByte fail and the A hook pass through).
+        assert_eq!(ansi_conversion_params(65001), (0x80, false));
+        for acp in [1252, 1250, 932, 936, 949, 950, 874] {
+            assert_eq!(ansi_conversion_params(acp), (0x400, true), "acp {acp}");
+        }
     }
 
     #[test]
