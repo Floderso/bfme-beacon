@@ -64,7 +64,11 @@ pub unsafe extern "system" fn bh___wsafdisset(s: SOCKET, set: *mut c_void) -> i3
 #[no_mangle]
 pub unsafe extern "system" fn bh_accept(s: SOCKET, addr: *mut c_void, addrlen: *mut i32) -> SOCKET {
     // SAFETY: arguments passed through.
-    unsafe { ffi::accept(s, addr, addrlen) }
+    let accepted = unsafe { ffi::accept(s, addr, addrlen) };
+    if accepted != ffi::INVALID_SOCKET && state::get().is_some() {
+        vsock::forget_stale(accepted);
+    }
+    accepted
 }
 
 /// `bind` (#2).

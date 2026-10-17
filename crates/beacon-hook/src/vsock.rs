@@ -163,6 +163,17 @@ fn disable_connreset(s: SOCKET) {
     };
 }
 
+/// A new handle `s` (from `socket` or `accept`) proves that a tracked socket with
+/// the same handle value was closed behind our back (e.g. by the last
+/// `WSACleanup`): forget that entry, so the new socket is not mistaken for a
+/// virtual one (its `recv`/`getsockname`/`closesocket` would be virtualised).
+pub fn forget_stale(s: SOCKET) {
+    let removed = table().remove(s);
+    if let Some(e) = removed {
+        info!("socket {s:#x}: handle reused, forgot stale {:?} entry (vport {})", e.state, e.vport);
+    }
+}
+
 /// `socket`: remembers `AF_INET`/`SOCK_DGRAM` sockets as candidates.
 ///
 /// # Safety
@@ -173,7 +184,15 @@ pub unsafe fn socket(af: i32, ty: i32, protocol: i32) -> SOCKET {
     let udp = af == i32::from(ffi::AF_INET)
         && ty == ffi::SOCK_DGRAM
         && (protocol == 0 || protocol == ffi::IPPROTO_UDP);
-    if s != ffi::INVALID_SOCKET && udp && !table().add_candidate(s) {
+    if s == ffi::INVALID_SOCKET {
+        return s;
+    }
+    if !udp {
+        forget_stale(s);
+        return s;
+    }
+    // `add_candidate` replaces a stale entry with the same handle.
+    if !table().add_candidate(s) {
         let evicted = sweep_dead();
         if !table().add_candidate(s) {
             info!("socket {s:#x}: table full ({MAX_SOCKETS} entries, {evicted} evicted); stays real");
