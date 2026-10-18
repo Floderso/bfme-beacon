@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use beacon_launcher::app::{self, App, AppOptions, ConnectRequest};
-use beacon_launcher::cli::{self, Command, Common, ConnectArgs, PasswordSource};
+use beacon_launcher::cli::{self, Command, Common, ConnectArgs, ModsAction, ModsArgs, PasswordSource};
 use beacon_launcher::config::LaunchOptions;
 use beacon_launcher::game::hook::HOOK_DLL_NAME;
 use beacon_launcher::instance::{self, Acquire, Action};
@@ -56,6 +56,7 @@ fn main() -> ExitCode {
         }
         Command::Detect(c) => detect(&c),
         Command::Fingerprint(c) => fingerprint_cmd(&c),
+        Command::Mods(m) => mods_cmd(&m),
         Command::RestoreName(c) => with_runtime(restore_name(c)),
         Command::Stop(c) => with_runtime(stop(c)),
         Command::Connect(c) => {
@@ -190,6 +191,135 @@ fn fingerprint_cmd(c: &Common) -> ExitCode {
         Err(e) => {
             eprintln!("fingerprint failed: {e}");
             ExitCode::from(EXIT_FAILURE)
+        }
+    }
+}
+
+fn print_json(value: &serde_json::Value) {
+    match serde_json::to_string_pretty(value) {
+        Ok(text) => println!("{text}"),
+        Err(e) => eprintln!("{e}"),
+    }
+}
+
+/// `mods list` / `mods prepare`: the BFME Workshop library (read-only) and an
+/// instance folder built from the user's own files (never downloads).
+fn mods_cmd(m: &ModsArgs) -> ExitCode {
+    use beacon_launcher::mods::import::ImportSources;
+    use beacon_launcher::mods::library::{AioLocations, PackageSet};
+    use beacon_launcher::mods::prepare::{self, PrepOutcome, PrepareInput};
+    use beacon_launcher::mods::store::Store;
+    use beacon_launcher::mods::{language_code, resolve, ModPaths};
+
+    let data = match data_dirs(&m.common) {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let (info, _) = app::detect_now(m.common.game_dir.as_deref(), None);
+    let appdata = beacon_launcher::paths::appdata_dir();
+    let paths = ModPaths::new(m.mods_dir.clone().unwrap_or_else(|| ModPaths::default_root(data.root())));
+    let aio = AioLocations::new(appdata.as_deref(), info.game_dir.as_deref());
+    let set = PackageSet::load(&aio, Some(&paths.manifest_cache()));
+    for (file, problem) in &set.problems {
+        eprintln!("skipped {}: {problem}", file.display());
+    }
+    let game_language = info.registry_language.as_deref().and_then(language_code);
+    let store = Store::open(&paths.store()).ok();
+    let known = |md5: &str| store.as_ref().and_then(|s| s.known_size(md5));
+    match &m.action {
+        ModsAction::List => {
+            let catalog = resolve::catalog(&set, game_language, &known);
+            print_json(&serde_json::json!({ "library": aio.library, "catalog": catalog }));
+            ExitCode::SUCCESS
+        }
+        ModsAction::Prepare { key, language } => {
+            let Some((guid, version)) = key.split_once('@') else {
+                eprintln!("expected GUID@VERSION");
+                return ExitCode::from(EXIT_USAGE);
+            };
+            let layers = match resolve::layers(&set, guid, Some(version)) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(EXIT_FAILURE);
+                }
+            };
+            let offered = resolve::languages(&layers);
+            let language = language
+                .clone()
+                .unwrap_or_else(|| resolve::default_language(&offered, game_language));
+            let config = match resolve::build_config(&layers, &language, &known) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(EXIT_FAILURE);
+                }
+            };
+            eprintln!(
+                "{} {} ({language}): {} files, configuration {}",
+                config.name,
+                config.version,
+                config.files.len(),
+                config.id
+            );
+            let sources = ImportSources {
+                game_dir: info.game_dir.clone(),
+                aio_caches: aio.caches.clone(),
+                extra_dirs: m.import_dirs.clone(),
+                exclude: vec![paths.root().to_path_buf()],
+            };
+            let input = PrepareInput {
+                config: &config,
+                paths: &paths,
+                sources: &sources,
+                workshop: None,
+            };
+            let cancel = AtomicBool::new(false);
+            let mut last = std::time::Instant::now();
+            let result = prepare::prepare(&input, &cancel, &mut |p| {
+                if last.elapsed() >= Duration::from_secs(2) {
+                    last = std::time::Instant::now();
+                    eprintln!(
+                        "{:?}: {} % ({} / {} MiB) {}",
+                        p.phase,
+                        p.percent,
+                        p.bytes_done >> 20,
+                        p.bytes_total >> 20,
+                        p.current.as_deref().unwrap_or("")
+                    );
+                }
+            });
+            match result {
+                Ok(PrepOutcome::Ready { instance, notice }) => {
+                    if let Some(n) = &notice {
+                        eprintln!("{n}");
+                    }
+                    print_json(&serde_json::json!({
+                        "state": "ready",
+                        "config": config,
+                        "instance": instance.root,
+                        "game_dir": instance.game_dir,
+                        "mod_dir": instance.mod_dir,
+                        "link_mode": instance.record.link_mode,
+                        "notice": notice,
+                    }));
+                    ExitCode::SUCCESS
+                }
+                Ok(PrepOutcome::Missing { count, files, notes }) => {
+                    print_json(&serde_json::json!({
+                        "state": "missing",
+                        "config_id": config.id,
+                        "count": count,
+                        "files": files,
+                        "notes": notes,
+                    }));
+                    ExitCode::from(EXIT_FAILURE)
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(EXIT_FAILURE)
+                }
+            }
         }
     }
 }

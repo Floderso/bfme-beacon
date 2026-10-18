@@ -462,3 +462,330 @@ fn sizes_are_enforced_and_urls_checked() {
     assert!(store.get(&md5_slow).is_none());
 }
 
+// ---------------------------------------------------------------------------
+// Two launchers and a real server agree on a configuration
+// ---------------------------------------------------------------------------
+
+mod lobby {
+    use super::*;
+    use beacon_launcher::agent::AgentOptions;
+    use beacon_launcher::app::CommandErrorKind;
+    use beacon_launcher::game::Registry;
+    use beacon_launcher::mods::manager::{LocalState, WorkshopSetup};
+    use beacon_launcher::paths::DataDirs;
+    use beacon_launcher::state::AppState;
+    use beacon_launcher::{App, AppOptions, ConnectRequest, SettingsPatch};
+    use beacon_proto::control::{derive_psk, ConfigState, KdfParams};
+    use beacon_server::config::Config;
+    use beacon_server::{hexfmt, RunningServer};
+    use std::path::Path;
+
+    const PASSWORD: &str = "mellon-mellon";
+    const SALT: [u8; 16] = *b"beacon-test-salt";
+    const T: Duration = Duration::from_secs(30);
+    const BASE: &str = "original-BFME1";
+    const PATCH: &str = "fake-patch-106";
+    const MOD: &str = "fake-mod-lot3a";
+
+    struct NoRegistry;
+    impl Registry for NoRegistry {
+        fn string(&self, _value: &str) -> Option<String> {
+            None
+        }
+        fn dword(&self, _value: &str) -> Option<u32> {
+            None
+        }
+    }
+
+    async fn start_server(dir: &Path) -> RunningServer {
+        let psk = tokio::task::spawn_blocking(|| derive_psk(PASSWORD, &SALT, &KdfParams::DEFAULT).unwrap())
+            .await
+            .unwrap();
+        let cfg = Config {
+            server_name: "Testserver".into(),
+            bind: "127.0.0.1".into(),
+            port: 0,
+            status_bind: String::new(),
+            salt: hexfmt::encode(&SALT),
+            psk: hexfmt::encode(&psk),
+            maps_dir: dir.join("maps").to_string_lossy().into_owned(),
+            data_dir: dir.join("server-data").to_string_lossy().into_owned(),
+            map_rescan_secs: 0,
+            ..Config::default()
+        };
+        std::fs::create_dir_all(dir.join("maps")).unwrap();
+        let mut settings = cfg.into_settings(dir).unwrap();
+        settings.lobby_refresh = Duration::from_millis(200);
+        beacon_server::start(settings).await.unwrap()
+    }
+
+    fn write(path: &Path, data: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, data).unwrap();
+    }
+
+    fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = beacon_launcher::mods::fsx::walk_files(dir, 16, 10_000, &|_| false)
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.rel, std::fs::read(&f.path).unwrap()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    async fn start_app(base: &Path, game: &Path, workshop: Option<WorkshopSetup>) -> App {
+        let mut o = AppOptions::new(DataDirs::with_base(base.join("data"), 1).unwrap());
+        o.registry = Arc::new(NoRegistry);
+        o.appdata = Some(base.join("appdata"));
+        o.game_dir = Some(game.to_path_buf());
+        o.fingerprint = false;
+        o.maps_dir = Some(base.join("Maps"));
+        o.hook_dll = Some(base.join("no-hook.dll"));
+        o.workshop = workshop;
+        o.agent = AgentOptions {
+            tick: Duration::from_millis(100),
+            ..AgentOptions::default()
+        };
+        App::start(o).await.unwrap()
+    }
+
+    async fn wait_state(app: &App, what: &str, pred: impl Fn(&AppState) -> bool) -> AppState {
+        let mut rx = app.subscribe();
+        let deadline = tokio::time::Instant::now() + T;
+        loop {
+            let s = app.snapshot();
+            if pred(&s) {
+                return s;
+            }
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(_)) | Err(_) => panic!("timeout waiting for {what}: {:#?}", s.mods.local),
+            }
+        }
+    }
+
+    fn connect(port: u16, name: &str) -> ConnectRequest {
+        ConnectRequest {
+            server: format!("127.0.0.1:{port}"),
+            name: name.to_owned(),
+            password: Some(PASSWORD.to_owned()),
+            use_remembered: false,
+            remember: false,
+        }
+    }
+
+    fn ready_for(s: &AppState, id: &str) -> bool {
+        matches!(&s.mods.local, LocalState::Ready { .. }) && s.mods.lobby.as_ref().is_some_and(|l| l.id == id)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_launchers_agree_on_a_configuration_and_report_readiness() {
+        let dir = Temp::new("lobby");
+        let fake = FakeServer::start();
+        // Synthetic packages: base game, a patch, a mod on the patch.
+        let base_files: [(&str, &[u8], usize); 4] = [
+            ("lotrbfme.exe", b"the workshop exe", 16),
+            ("lang\\English.big", b"english strings", 15),
+            ("lang\\German.big", b"german strings", 14),
+            ("Data.big", b"data archive", 0),
+        ];
+        let patch_files: [(&str, &[u8]); 2] = [("_patch106.big", b"patch 1.06"), ("asset.dat", b"asset 1.06")];
+        let mod_files: [(&str, &[u8]); 2] = [("_zmod_data.big", b"the mod's data"), ("asset.dat", b"asset of the mod")];
+        let mod_big = data(300_000, 42);
+        let mod_big_md5 = fake.add_file(&mod_big, Behaviour::Slow(Duration::from_millis(250)));
+        let lib_manifest = |guid: &str, name: &str, files: Vec<(String, String, usize, String)>, deps: Vec<String>| {
+            let files: Vec<serde_json::Value> = files
+                .iter()
+                .map(|(n, m, size, lang)| serde_json::json!({"Guid": m, "Name": n, "Url": fake.file_url(m), "Md5": m, "Language": lang, "Size": size}))
+                .collect();
+            serde_json::json!({
+                "Guid": guid, "Name": name, "Version": "1.0.0", "Author": "Tester", "Owner": OWNER,
+                "Game": 0, "Type": 0, "Language": "EN", "Files": files, "Dependencies": deps,
+                "SocialLinks": ["https://example.org/mod"], "Maps": [], "Factions": []
+            })
+            .to_string()
+        };
+        let base_json = lib_manifest(
+            BASE,
+            "Vanilla (1.03)",
+            base_files
+                .iter()
+                .map(|(n, d, size)| {
+                    let lang = if n.contains("German") { "DE" } else if n.contains("English") { "EN" } else { "ALL" };
+                    (n.to_string(), md5_hex(d), *size, lang.to_owned())
+                })
+                .collect(),
+            vec![],
+        );
+        let patch_json = lib_manifest(
+            PATCH,
+            "Patch 1.06",
+            patch_files.iter().map(|(n, d)| (n.to_string(), md5_hex(d), d.len(), "ALL".to_owned())).collect(),
+            vec![],
+        );
+        let mut mod_list: Vec<(String, String, usize, String)> =
+            mod_files.iter().map(|(n, d)| (n.to_string(), md5_hex(d), d.len(), "ALL".to_owned())).collect();
+        mod_list.push(("_zmod_audio.big".into(), mod_big_md5.clone(), mod_big.len(), "ALL".into()));
+        let mod_json = lib_manifest(MOD, "Fake Legends", mod_list, vec![format!("{PATCH}:1.0.0")]);
+        fake.state.manifests.lock().unwrap().insert(format!("{MOD}:1.0.0"), mod_json.clone());
+        fake.state.manifests.lock().unwrap().insert(format!("{PATCH}:1.0.0"), patch_json.clone());
+
+        // Host: the AIO library and everything in the game folder (as if the AIO
+        // had synced the mod). Guest: no library, base + patch only; the mod's
+        // big archive must come from the (fake) workshop.
+        let host = dir.0.join("host");
+        let guest = dir.0.join("guest");
+        let lib = host.join("appdata").join("BFME Workshop").join("Library");
+        write(&lib.join("original-BFME1.json"), base_json.as_bytes());
+        write(&lib.join(format!("{PATCH}.json")), patch_json.as_bytes());
+        write(&lib.join(format!("{MOD}.json")), mod_json.as_bytes());
+        for (game, with_mod) in [(host.join("BFME1"), true), (guest.join("BFME1"), false)] {
+            for (n, d, _) in &base_files {
+                write(&beacon_launcher::mods::join_package_path(&game, n), d);
+            }
+            for (n, d) in &patch_files {
+                write(&game.join(n), d);
+            }
+            if with_mod {
+                for (n, d) in &mod_files {
+                    write(&game.join(n), d);
+                }
+                write(&game.join("_zmod_audio.big"), &mod_big);
+            } else {
+                // The AIO keeps the patch's asset.dat here; the mod's comes from its cache.
+                write(
+                    &guest.join("BFME Workshop").join("Cache").join(format!("{}.pfcache", md5_hex(b"asset of the mod"))),
+                    b"asset of the mod",
+                );
+                write(&game.join("_zmod_data.big.old"), b"the mod's data");
+            }
+        }
+        let host_game_before = snapshot(&host.join("BFME1"));
+        let library_before = snapshot(&lib);
+        let guest_game_before = snapshot(&guest.join("BFME1"));
+
+        let server = start_server(&dir.0).await;
+        let port = server.control_addr().port();
+        let frodo = start_app(&host, &host.join("BFME1"), None).await;
+        let workshop = WorkshopSetup {
+            options: WorkshopOptions {
+                endpoints: fake.endpoints(),
+                max_parallel: 2,
+                backoff: fast(),
+                max_file_bytes: 1 << 20,
+                timeout: Duration::from_secs(10),
+            },
+            transport: Arc::new(WinHttp {
+                user_agent: workshop::user_agent(),
+                system_proxy: false,
+            }),
+        };
+        let sam = start_app(&guest, &guest.join("BFME1"), Some(workshop)).await;
+        for app in [&frodo, &sam] {
+            app.update_settings(SettingsPatch {
+                auto_launch_on_host_start: Some(false),
+                ..SettingsPatch::default()
+            })
+            .await
+            .unwrap();
+        }
+        // Workshop downloads can only be switched on where a workshop is available.
+        let refused = frodo
+            .update_settings(SettingsPatch {
+                workshop_downloads: Some(true),
+                ..SettingsPatch::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, CommandErrorKind::InvalidInput);
+        sam.update_settings(SettingsPatch {
+            workshop_downloads: Some(true),
+            ..SettingsPatch::default()
+        })
+        .await
+        .unwrap();
+
+        frodo.connect(connect(port, "Frodo")).await.unwrap();
+        wait_state(&frodo, "Frodo connected", |s| s.server.as_ref().is_some_and(|x| x.you_are_host)).await;
+        sam.connect(connect(port, "Sam")).await.unwrap();
+        let s = wait_state(&sam, "Sam connected", |s| s.is_connected() && s.server.is_some()).await;
+        assert!(s.server.unwrap().features.iter().any(|f| f == "game_config"));
+        assert!(sam.set_game_config(None, None).await.is_err(), "only the host chooses");
+
+        let key = format!("{MOD}@1.0.0");
+        let s = wait_state(&frodo, "catalog", |s| s.mods.catalog.iter().any(|e| e.key == key)).await;
+        let entry = s.mods.catalog.iter().find(|e| e.key == key).unwrap().clone();
+        assert_eq!(entry.with, ["Patch 1.06 1.0.0"]);
+        assert_eq!(entry.languages, ["DE", "EN"]);
+        assert!(entry.problem.is_none(), "{entry:?}");
+
+        frodo.set_game_config(Some(key.clone()), Some("EN".into())).await.unwrap();
+        let s = wait_state(&sam, "configuration arrives", |s| s.mods.lobby.is_some()).await;
+        let lobby = s.mods.lobby.clone().unwrap();
+        assert_eq!((lobby.name.as_str(), lobby.language.as_str(), lobby.set_by.as_str()), ("Fake Legends", "EN", "Frodo"));
+        let id = lobby.id.clone();
+        // Sam is still downloading: the host's "start all" is refused.
+        frodo.launch_all().await.unwrap();
+        wait_state(&frodo, "launch refused", |s| s.notices.iter().any(|n| n.text.contains("Noch nicht alle"))).await;
+        let s = wait_state(&frodo, "Sam reports progress", |s| {
+            s.players.iter().any(|p| p.name == "Sam" && p.config.as_ref().is_some_and(|c| c.id == id))
+        })
+        .await;
+        let sam_status = s.players.iter().find(|p| p.name == "Sam").unwrap().config.clone().unwrap();
+        assert!(matches!(sam_status.state, ConfigState::Preparing | ConfigState::Ready), "{sam_status:?}");
+
+        let host_ready = wait_state(&frodo, "host ready", |s| ready_for(s, &id)).await;
+        let guest_ready = wait_state(&sam, "guest ready", |s| ready_for(s, &id)).await;
+        let s = wait_state(&frodo, "both reported ready", |s| {
+            s.players.len() == 2 && s.players.iter().all(|p| p.config.as_ref().is_some_and(|c| c.is_ready_for(&id)))
+        })
+        .await;
+        assert_eq!(s.players.len(), 2);
+
+        // Both instances hold the same files with the same content.
+        let game_dir = |s: &AppState| match &s.mods.local {
+            LocalState::Ready { game_dir, .. } => game_dir.clone(),
+            other => panic!("{other:?}"),
+        };
+        let (hd, gd) = (game_dir(&host_ready), game_dir(&guest_ready));
+        assert_ne!(hd, gd);
+        let files = snapshot(&hd);
+        assert_eq!(files, snapshot(&gd));
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["_patch106.big", "_zmod_audio.big", "_zmod_data.big", "asset.dat", "data.big", "lang\\english.big", "lotrbfme.exe"]
+        );
+        assert_eq!(files.iter().find(|(n, _)| n == "asset.dat").unwrap().1, b"asset of the mod", "the mod's layer wins");
+        assert_eq!(fake.hits(&format!("{MOD}:1.0.0")), 1, "one manifest fetch");
+        assert_eq!(fake.hits(&mod_big_md5), 1, "one download");
+        wait_state(&sam, "storage overview", |s| s.mods.storage.store_files >= 7 && s.mods.storage.instances.len() == 1).await;
+
+        // Everybody is ready: the start goes through.
+        frodo.launch_all().await.unwrap();
+        wait_state(&sam, "launch", |s| s.notices.iter().any(|n| n.text == "the host started the game")).await;
+
+        // Back to vanilla: no instance, everybody "ready" for vanilla.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        frodo.set_game_config(None, None).await.unwrap();
+        wait_state(&sam, "vanilla", |s| s.mods.lobby.is_none() && matches!(s.mods.local, LocalState::Vanilla)).await;
+        wait_state(&frodo, "vanilla reports", |s| {
+            s.players.len() == 2 && s.players.iter().all(|p| p.config.as_ref().is_some_and(|c| c.is_ready_for("vanilla")))
+        })
+        .await;
+        // Clean-up removes the now unused instance and its store files.
+        let removed = sam.mods_cleanup().await.unwrap();
+        assert_eq!(removed.instances, 1);
+        assert!(removed.files >= 7);
+        assert!(!gd.exists());
+
+        // The real installations and the AIO's library were only read.
+        assert_eq!(snapshot(&host.join("BFME1")), host_game_before);
+        assert_eq!(snapshot(&lib), library_before);
+        assert_eq!(snapshot(&guest.join("BFME1")), guest_game_before);
+        frodo.quit().await;
+        sam.quit().await;
+        server.shutdown().await;
+    }
+}

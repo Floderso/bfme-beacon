@@ -161,6 +161,8 @@ pub struct GameInfo {
     pub registry_leaf: Option<String>,
     /// Registry `UseLocalUserMaps`.
     pub registry_use_local_user_maps: Option<u32>,
+    /// Registry `Language` (`English`, `German`, …).
+    pub registry_language: Option<String>,
     /// Human-readable problems.
     pub warnings: Vec<String>,
 }
@@ -240,6 +242,10 @@ pub fn detect(override_dir: Option<&Path>, reg: &dyn Registry, appdata: Option<&
     });
     let registry_leaf = reg.string("UserDataLeafName").filter(|l| !l.trim().is_empty());
     let registry_use_local_user_maps = reg.dword("UseLocalUserMaps");
+    let registry_language = reg
+        .string("Language")
+        .map(|l| l.trim().chars().take(32).collect::<String>())
+        .filter(|l| !l.is_empty());
     let user = appdata.map(|base| {
         resolve_user_dirs(
             base,
@@ -265,6 +271,7 @@ pub fn detect(override_dir: Option<&Path>, reg: &dyn Registry, appdata: Option<&
         user,
         registry_leaf,
         registry_use_local_user_maps,
+        registry_language,
         warnings,
     }
 }

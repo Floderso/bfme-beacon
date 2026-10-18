@@ -258,8 +258,9 @@ impl fmt::Display for ControlError {
 
 impl std::error::Error for ControlError {}
 
-/// What the agent measures, reported to the server via `status`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What the agent measures and the readiness for the lobby's game
+/// configuration, reported to the server via `status`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatusReport {
     /// The game is running.
     pub in_game: bool,
@@ -267,6 +268,8 @@ pub struct StatusReport {
     pub rtt_ms: Option<u32>,
     /// Relay loss.
     pub loss_pct: Option<u8>,
+    /// Readiness for the game configuration.
+    pub config: Option<beacon_proto::control::ConfigStatus>,
 }
 
 /// Details of an established session.
@@ -286,6 +289,8 @@ pub struct Connected {
     pub relay_addr: SocketAddr,
     /// The identity was pinned now (first login).
     pub newly_pinned: bool,
+    /// Optional protocol features of the server (`welcome.features`).
+    pub features: Vec<String>,
 }
 
 /// Events from the supervisor.

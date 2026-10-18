@@ -92,6 +92,8 @@ pub fn kind_name(kind: CommandErrorKind) -> &'static str {
         CommandErrorKind::LaunchFailed => "launch_failed",
         CommandErrorKind::Busy => "busy",
         CommandErrorKind::Io => "io",
+        CommandErrorKind::NotReady => "not_ready",
+        CommandErrorKind::Unsupported => "unsupported",
     }
 }
 
@@ -155,6 +157,24 @@ fn check_settings(p: &SettingsPatch) -> Result<(), ApiError> {
                 "launch",
                 "resolution_range",
                 format!("resolution outside {}..={}", RES_RANGE.start(), RES_RANGE.end()),
+            ));
+        }
+    }
+    if let Some(d) = p.mods_dir.as_deref().map(str::trim) {
+        if !d.is_empty() && !Path::new(d).is_absolute() {
+            return Err(ApiError::invalid(
+                "mods_dir",
+                "path_not_absolute",
+                "the mods folder must be an absolute path",
+            ));
+        }
+    }
+    if let Some(dirs) = &p.import_dirs {
+        if dirs.iter().map(|d| d.trim()).any(|d| !d.is_empty() && !Path::new(d).is_absolute()) {
+            return Err(ApiError::invalid(
+                "import_dirs",
+                "path_not_absolute",
+                "import folders must be absolute paths",
             ));
         }
     }
@@ -327,6 +347,73 @@ pub(super) async fn password_forget(State(s): State<Shared>, b: Body<ServerBody>
     Ok(Json(json!({ "ok": true, "removed": removed })))
 }
 
+/// `POST /api/mods/select {key, language?}`: host only; `key` = a catalog key
+/// (`guid@version`) or `null` for vanilla.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SelectBody {
+    key: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+}
+
+pub(super) async fn mods_select(State(s): State<Shared>, b: Body<SelectBody>) -> ApiResult {
+    let b = body(b)?;
+    if let Some(k) = &b.key {
+        if k.is_empty() || k.len() > 200 || !k.contains('@') {
+            return Err(ApiError::invalid("key", "config_key", "invalid configuration key"));
+        }
+    }
+    if let Some(l) = &b.language {
+        if !beacon_proto::control::is_valid_language(l) {
+            return Err(ApiError::invalid("language", "language_code", "invalid language code"));
+        }
+    }
+    s.app.set_game_config(b.key, b.language).await?;
+    Ok(ok())
+}
+
+/// `POST /api/mods/retry`: prepare the lobby's configuration again.
+pub(super) async fn mods_retry(State(s): State<Shared>) -> Json<Value> {
+    s.app.mods_retry();
+    ok()
+}
+
+/// `POST /api/mods/cancel`: cancel the preparation.
+pub(super) async fn mods_cancel(State(s): State<Shared>) -> Json<Value> {
+    s.app.mods_cancel();
+    ok()
+}
+
+/// `POST /api/mods/reload`: read the BFME Workshop library again.
+pub(super) async fn mods_reload(State(s): State<Shared>) -> Json<Value> {
+    s.app.mods_reload();
+    ok()
+}
+
+/// `POST /api/mods/import {path}`: search a folder for package files.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PathBody {
+    path: String,
+}
+
+pub(super) async fn mods_import(State(s): State<Shared>, b: Body<PathBody>) -> ApiResult {
+    let path = body(b)?.path;
+    let trimmed = path.trim();
+    if trimmed.is_empty() || !Path::new(trimmed).is_absolute() {
+        return Err(ApiError::invalid("path", "path_not_absolute", "the folder must be an absolute path"));
+    }
+    s.app.mods_import_folder(trimmed).await?;
+    Ok(ok())
+}
+
+/// `POST /api/mods/cleanup`: remove unused instances and store files.
+pub(super) async fn mods_cleanup(State(s): State<Shared>) -> ApiResult {
+    let report = s.app.mods_cleanup().await?;
+    Ok(Json(json!({ "ok": true, "removed": report })))
+}
+
 /// `POST /api/name/restore`: BFME's original LAN name back into Network.ini.
 pub(super) async fn name_restore(State(s): State<Shared>) -> ApiResult {
     let restored = s.app.restore_user_name().await?;
@@ -382,6 +469,8 @@ mod tests {
             LaunchFailed,
             Busy,
             Io,
+            NotReady,
+            Unsupported,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind_name(kind), "{kind:?}");
         }

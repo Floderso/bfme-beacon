@@ -215,6 +215,24 @@ impl HashCache {
         let keep: BTreeSet<String> = sources.iter().map(|s| cache_key(&s.abs)).collect();
         self.entries.retain(|k, _| keep.contains(k));
     }
+
+    /// Keeps the entries of `sources` and, up to a bound, the entries of other
+    /// files that still exist unchanged (another folder that is fingerprinted in
+    /// turn: the real installation and Beacon's instance folders).
+    pub fn retain_valid(&mut self, sources: &[Source]) {
+        let keep: BTreeSet<String> = sources.iter().map(|s| cache_key(&s.abs)).collect();
+        let mut others = 0usize;
+        self.entries.retain(|k, e| {
+            if keep.contains(k) {
+                return true;
+            }
+            others += 1;
+            others <= MAX_FILES
+                && fs::metadata(k)
+                    .ok()
+                    .is_some_and(|m| m.is_file() && m.len() == e.size && mtime_ns(&m) == e.mtime_ns)
+        });
+    }
 }
 
 /// Progress of a computation.
@@ -328,17 +346,82 @@ pub fn run(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&Progress),
 ) -> Result<Fingerprint, FingerprintError> {
-    let sources = collect(game_dir, hook_dll)?;
+    run_dirs(game_dir, None, hook_dll, cache_file, cancel, progress)
+}
+
+/// Every regular file below a `-mod` folder (BFME mounts its `*.big` files
+/// recursively and finds its loose files first), recorded as `mod/<path>`.
+pub fn collect_mod_dir(mod_dir: &Path) -> Result<Vec<Source>, FingerprintError> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(PathBuf, String, usize)> = vec![(mod_dir.to_path_buf(), "mod".to_owned(), 0)];
+    let mut visited = 0usize;
+    while let Some((dir, prefix, depth)) = stack.pop() {
+        let entries = fs::read_dir(&dir).map_err(|e| FingerprintError::Io(dir.clone(), e))?;
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_ENTRIES || out.len() >= MAX_FILES {
+                return Err(FingerprintError::TooManyFiles);
+            }
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_symlink() {
+                continue;
+            }
+            let rel = format!("{prefix}/{}", entry.file_name().to_string_lossy());
+            if kind.is_dir() && depth < MAX_DEPTH {
+                stack.push((entry.path(), rel, depth + 1));
+            } else if kind.is_file() {
+                out.push(Source { rel, abs: entry.path() });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Like [`run`], with the `-mod` folder of a type-1 package (Beacon instance).
+pub fn run_dirs(
+    game_dir: &Path,
+    mod_dir: Option<&Path>,
+    hook_dll: Option<&Path>,
+    cache_file: &Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&Progress),
+) -> Result<Fingerprint, FingerprintError> {
+    let mut sources = collect(game_dir, hook_dll)?;
+    if let Some(m) = mod_dir {
+        sources.extend(collect_mod_dir(m)?);
+        sources.sort_by_key(|a| normalize_path(&a.rel));
+    }
     let mut cache = HashCache::load(cache_file);
     let result = compute(&sources, &mut cache, crate::BUILD_ID, cancel, progress);
     if result.is_ok() {
-        cache.retain_sources(&sources);
+        cache.retain_valid(&sources);
     }
     // Partial work is kept even after an error or cancellation.
     if let Err(e) = cache.save(cache_file) {
         tracing::warn!("cannot save {}: {e}", cache_file.display());
     }
     result
+}
+
+/// Adds known BLAKE3 hashes of existing files to the cache (Beacon's store
+/// knows them for the files of an instance folder), so that the fingerprint of
+/// a fresh instance needs no hashing.
+pub fn seed_cache(cache_file: &Path, files: &[(PathBuf, String)]) -> io::Result<()> {
+    let mut cache = HashCache::load(cache_file);
+    for (path, blake3) in files {
+        let meta = fs::metadata(path)?;
+        if blake3.len() == 64 {
+            cache.insert(
+                path,
+                CacheEntry {
+                    size: meta.len(),
+                    mtime_ns: mtime_ns(&meta),
+                    blake3: blake3.clone(),
+                },
+            );
+        }
+    }
+    cache.save(cache_file)
 }
 
 #[cfg(test)]
@@ -449,6 +532,39 @@ mod tests {
             collect(&d.join("missing"), None),
             Err(FingerprintError::Io(..))
         ));
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+
+    #[test]
+    fn mod_dir_seed_and_two_folders_in_turn() {
+        let d = std::env::temp_dir().join(format!("beacon-fp-mod-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let game = d.join("game");
+        let modd = d.join("mod");
+        for (p, data) in [(game.join("lotrbfme.exe"), &b"exe"[..]), (game.join("a.big"), b"a"), (modd.join("sub").join("m.big"), b"m")] {
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, data).unwrap();
+        }
+        let cache_file = d.join("cache.json");
+        let cancel = AtomicBool::new(false);
+        // Seeded hashes are used as they are (proof: a wrong seed changes the digest).
+        seed_cache(&cache_file, &[(game.join("a.big"), "1".repeat(64))]).unwrap();
+        let seeded = run_dirs(&game, Some(&modd), None, &cache_file, &cancel, &mut |_| {}).unwrap();
+        assert!(seeded.entries.iter().any(|e| e.path == "mod/sub/m.big"));
+        assert!(seeded.entries.iter().any(|e| e.path == "a.big" && e.blake3_hex == "1".repeat(64)));
+        // Another folder in between keeps the first folder's entries.
+        let other = d.join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("o.big"), b"o").unwrap();
+        run(&other, None, &cache_file, &cancel, &mut |_| {}).unwrap();
+        let cache = HashCache::load(&cache_file);
+        assert!(cache.entries.contains_key(&cache_key(&game.join("a.big"))));
+        assert!(cache.entries.contains_key(&cache_key(&other.join("o.big"))));
         let _ = fs::remove_dir_all(&d);
     }
 }

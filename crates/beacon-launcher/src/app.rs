@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use beacon_proto::control::{Chunk, ClientMsg, ErrorCode, MapInfo, ServerMsg};
+use beacon_proto::control::{
+    is_valid_language, Chunk, ClientMsg, ConfigStatus, ErrorCode, MapInfo, ServerMsg, FEATURE_GAME_CONFIG,
+};
 use beacon_proto::fingerprint::{beacon_serial, Fingerprint};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -32,6 +34,10 @@ use crate::game::netini::{self, NETWORK_INI};
 use crate::game::userdir;
 use crate::logging;
 use crate::maps::{self, ChunkError, ChunkSource, InstalledRecord, MapState};
+use crate::mods::manager::{
+    CleanupReport, ModManager, ModManagerOptions, ModsView, ReadyInstance, WorkshopSetup, MAX_IMPORT_DIRS,
+};
+use crate::mods::store::Store;
 use crate::paths::DataDirs;
 use crate::state::{
     diff_files, AppState, Change, ChatLine, ConnectionState, FingerprintState, GameProcess, MapEntry,
@@ -70,6 +76,9 @@ pub struct AppOptions {
     pub fingerprint: bool,
     /// Maps folder override (tests).
     pub maps_dir: Option<PathBuf>,
+    /// A workshop endpoint for tests (the real BFME Workshop is never used
+    /// while `mods::WORKSHOP_DOWNLOADS_AVAILABLE` is false).
+    pub workshop: Option<WorkshopSetup>,
 }
 
 impl AppOptions {
@@ -86,6 +95,7 @@ impl AppOptions {
             agent: AgentOptions::default(),
             fingerprint: true,
             maps_dir: None,
+            workshop: None,
         }
     }
 
@@ -123,6 +133,10 @@ pub enum CommandErrorKind {
     Busy,
     /// File system error.
     Io,
+    /// The lobby's game configuration is not prepared yet.
+    NotReady,
+    /// The server does not support this (older beacon-server).
+    Unsupported,
 }
 
 /// A failed command.
@@ -247,6 +261,13 @@ pub struct SettingsPatch {
     pub auto_launch_on_host_start: Option<bool>,
     /// Redundancy overrides.
     pub redundancy: Option<RedundancyOverrides>,
+    /// Folder for the mod store and instances; `""` = default.
+    pub mods_dir: Option<String>,
+    /// Folders searched for package files (replaces the list).
+    pub import_dirs: Option<Vec<String>>,
+    /// Download missing package files from the BFME Workshop (refused while
+    /// not available).
+    pub workshop_downloads: Option<bool>,
 }
 
 enum ChunkReply {
@@ -274,6 +295,11 @@ struct Inner {
     launching: AtomicBool,
     notice_seq: AtomicU64,
     quit_tx: watch::Sender<bool>,
+    mods: Arc<ModManager>,
+    /// The folders the current fingerprint covers.
+    fp_target: Mutex<Option<(PathBuf, Option<PathBuf>)>>,
+    /// The configuration id of the instance a running game was started from.
+    launched_instance: Mutex<Option<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -308,6 +334,14 @@ impl App {
             ..opts.agent
         };
         let (agent, _agent_task) = AgentHandle::start(agent_opts).await.map_err(StartError::Agent)?;
+        let mods = ModManager::new(
+            ModManagerOptions {
+                data_dir: root.clone(),
+                appdata: opts.appdata.clone(),
+                workshop: opts.workshop.clone(),
+            },
+            cfg.mods.clone(),
+        );
         let state = AppState {
             version: crate::VERSION.to_owned(),
             instance: opts.data.instance(),
@@ -331,6 +365,7 @@ impl App {
             peer_files: BTreeMap::new(),
             settings: SettingsView::from_config(&cfg),
             notices: Default::default(),
+            mods: mods.snapshot(),
         };
         let (changes, _) = broadcast::channel(256);
         let (events_tx, events_rx) = mpsc::channel(256);
@@ -343,7 +378,11 @@ impl App {
             control: tokio::sync::Mutex::new(None),
             generation: AtomicU64::new(0),
             events_tx,
-            status_tx: watch::channel(StatusReport::default()).0,
+            status_tx: watch::channel(StatusReport {
+                config: Some(ConfigStatus::vanilla()),
+                ..StatusReport::default()
+            })
+            .0,
             fingerprint_tx: watch::channel(None).0,
             fp_cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             session_name: Mutex::new(None),
@@ -354,12 +393,16 @@ impl App {
             launching: AtomicBool::new(false),
             notice_seq: AtomicU64::new(0),
             quit_tx: watch::channel(false).0,
+            mods: Arc::clone(&mods),
+            fp_target: Mutex::new(None),
+            launched_instance: Mutex::new(None),
         });
         if let Some(w) = warning {
             inner.notice(NoticeLevel::Warning, w);
         }
         tokio::spawn(pump_control(Arc::clone(&inner), events_rx));
         tokio::spawn(pump_agent(Arc::clone(&inner), inner.agent.watch_stats()));
+        tokio::spawn(pump_mods(Arc::clone(&inner), mods.view(), mods.status(), mods.ready()));
         let detect_inner = Arc::clone(&inner);
         tokio::spawn(async move { detect_inner.detect().await });
         Ok(Self { inner })
@@ -415,6 +458,7 @@ impl App {
         }
         *lock(&inner.session_name) = Some(name.clone());
         *lock(&inner.session_server) = addr.key();
+        inner.mods.set_lobby_config(None, String::new());
         inner.refresh_settings();
         // New generation and state in one step: events of the old session that are
         // still queued can no longer change the state.
@@ -448,6 +492,7 @@ impl App {
         let inner = &self.inner;
         let mut control = inner.control.lock().await;
         inner.new_generation(ConnectionState::Disconnected);
+        inner.mods.set_lobby_config(None, String::new());
         if let Some(h) = control.take() {
             h.disconnect().await;
             // The supervisor ends the relay session itself unless it had to be aborted.
@@ -496,6 +541,101 @@ impl App {
             .await
     }
 
+    /// Host only: sets the lobby's game configuration from a catalog entry
+    /// (`guid@version`) and language (`None` = the default variant); `None` as
+    /// key = vanilla.
+    pub async fn set_game_config(&self, key: Option<String>, language: Option<String>) -> Result<(), CommandError> {
+        self.inner.require_host()?;
+        if !self.inner.server_has(FEATURE_GAME_CONFIG) {
+            return Err(CommandError::new(
+                CommandErrorKind::Unsupported,
+                "the server does not support game configurations (update beacon-server)",
+            ));
+        }
+        if let Some(l) = &language {
+            if !is_valid_language(l) {
+                return Err(CommandError::invalid(format!("invalid language {l:?}")));
+            }
+        }
+        let config = match key {
+            None => None,
+            Some(key) => {
+                let mods = Arc::clone(&self.inner.mods);
+                let resolved = tokio::task::spawn_blocking(move || mods.resolve(&key, language.as_deref()))
+                    .await
+                    .map_err(|e| CommandError::new(CommandErrorKind::Io, e.to_string()))?
+                    .map_err(CommandError::invalid)?;
+                Some(Box::new(resolved))
+            }
+        };
+        let msg = ClientMsg::SetGameConfig { config };
+        if msg.to_json().is_err() {
+            return Err(CommandError::invalid("the configuration has too many files for one message"));
+        }
+        self.inner.send(msg).await
+    }
+
+    /// Prepares the lobby's game configuration again.
+    pub fn mods_retry(&self) {
+        self.inner.mods.retry();
+    }
+
+    /// Cancels the running preparation.
+    pub fn mods_cancel(&self) {
+        self.inner.mods.cancel();
+    }
+
+    /// Reads the AIO library again.
+    pub fn mods_reload(&self) {
+        self.inner.mods.reload_catalog();
+        self.inner.mods.refresh_storage();
+    }
+
+    /// Adds a folder to search for package files and prepares again.
+    pub async fn mods_import_folder(&self, path: &str) -> Result<(), CommandError> {
+        let dir = PathBuf::from(path.trim());
+        if !dir.is_absolute() {
+            return Err(CommandError::invalid("the folder must be an absolute path"));
+        }
+        let probe = dir.clone();
+        let is_dir = tokio::task::spawn_blocking(move || probe.is_dir()).await.unwrap_or(false);
+        if !is_dir {
+            return Err(CommandError::invalid(format!("{} is not a folder", dir.display())));
+        }
+        let key = dir.to_string_lossy().to_lowercase();
+        self.inner
+            .config
+            .update(|c| {
+                c.mods.import_dirs.retain(|d| d.to_string_lossy().to_lowercase() != key);
+                c.mods.import_dirs.insert(0, dir.clone());
+                c.mods.import_dirs.truncate(MAX_IMPORT_DIRS);
+            })
+            .map_err(|e| CommandError::new(CommandErrorKind::Io, format!("cannot save the settings: {e}")))?;
+        self.inner.refresh_settings();
+        self.inner.mods.set_settings(self.inner.config.get().mods);
+        self.inner.mods.retry();
+        Ok(())
+    }
+
+    /// Removes unused instance folders and store files.
+    pub async fn mods_cleanup(&self) -> Result<CleanupReport, CommandError> {
+        let in_use = if lock(&self.inner.state).game_process.as_ref().is_some_and(|g| g.running) {
+            lock(&self.inner.launched_instance).clone()
+        } else {
+            None
+        };
+        let mods = Arc::clone(&self.inner.mods);
+        tokio::task::spawn_blocking(move || mods.cleanup(in_use.as_deref()))
+            .await
+            .map_err(|e| CommandError::new(CommandErrorKind::Io, e.to_string()))?
+            .map_err(|e| CommandError::new(CommandErrorKind::Io, e))
+    }
+
+    /// The mod view (also part of the snapshot).
+    pub fn mods_view(&self) -> ModsView {
+        self.inner.mods.snapshot()
+    }
+
     /// Starts BFME (hook install, name sync, test-mode user folder, process).
     pub async fn launch_game(&self) -> Result<(), CommandError> {
         Arc::clone(&self.inner).launch_game().await
@@ -535,6 +675,40 @@ impl App {
                 }
             }
         }
+        let mods_dir = match patch.mods_dir.as_deref().map(str::trim) {
+            None => None,
+            Some("") => Some(None),
+            Some(d) => {
+                let p = PathBuf::from(d);
+                if !p.is_absolute() {
+                    return Err(CommandError::invalid("the mods folder must be an absolute path"));
+                }
+                Some(Some(p))
+            }
+        };
+        let import_dirs = match &patch.import_dirs {
+            None => None,
+            Some(list) => {
+                let dirs: Vec<PathBuf> = list
+                    .iter()
+                    .map(|d| d.trim())
+                    .filter(|d| !d.is_empty())
+                    .map(PathBuf::from)
+                    .collect();
+                if dirs.iter().any(|d| !d.is_absolute()) {
+                    return Err(CommandError::invalid("import folders must be absolute paths"));
+                }
+                if dirs.len() > MAX_IMPORT_DIRS {
+                    return Err(CommandError::invalid(format!("at most {MAX_IMPORT_DIRS} import folders")));
+                }
+                Some(dirs)
+            }
+        };
+        if patch.workshop_downloads == Some(true) && !self.inner.mods.workshop_available() {
+            return Err(CommandError::invalid(
+                "workshop downloads are not available yet (waiting for the BFME Foundation Team's consent)",
+            ));
+        }
         let before = self.inner.config.get();
         let patch2 = patch.clone();
         self.inner
@@ -558,12 +732,25 @@ impl App {
                 if let Some(r) = patch2.redundancy {
                     c.redundancy = r;
                 }
+                if let Some(d) = mods_dir {
+                    c.mods.dir = d;
+                }
+                if let Some(d) = import_dirs {
+                    c.mods.import_dirs = d;
+                }
+                if let Some(w) = patch2.workshop_downloads {
+                    c.mods.workshop_downloads = w;
+                }
+                c.mods.sanitize();
             })
             .map_err(|e| CommandError::new(CommandErrorKind::Io, format!("cannot save the settings: {e}")))?;
         let after = self.inner.config.get();
         self.inner.refresh_settings();
         if after.redundancy != before.redundancy {
             self.inner.agent.set_redundancy(after.redundancy).await;
+        }
+        if after.mods != before.mods {
+            self.inner.mods.set_settings(after.mods.clone());
         }
         if after.game_dir != before.game_dir {
             let inner = Arc::clone(&self.inner);
@@ -654,6 +841,7 @@ impl App {
             return;
         }
         self.disconnect().await;
+        self.inner.mods.shutdown();
         lock(&self.inner.fp_cancel).store(true, Ordering::Relaxed);
         self.inner.agent.shutdown().await;
         let game_running = lock(&self.inner.state)
@@ -790,10 +978,26 @@ impl Inner {
     }
 
     fn maps_dir(&self) -> Option<PathBuf> {
-        self.opts
-            .maps_dir
-            .clone()
-            .or_else(|| self.user_dirs().map(|u| u.maps_dir))
+        if let Some(d) = &self.opts.maps_dir {
+            return Some(d.clone());
+        }
+        let user = self.user_dirs()?;
+        // With `UseLocalUserMaps` the game uses `UserData\Maps` below the folder it
+        // was started from: the instance folder while a configuration is active.
+        match self.mods.ready_instance() {
+            Some(r) if user.use_local_user_maps && self.mods.lobby_config().is_some() => {
+                Some(r.game_dir.join("UserData").join("Maps"))
+            }
+            _ => Some(user.maps_dir),
+        }
+    }
+
+    /// `true` if the connected server announced `feature`.
+    fn server_has(&self, feature: &str) -> bool {
+        lock(&self.state)
+            .server
+            .as_ref()
+            .is_some_and(|s| s.features.iter().any(|f| f == feature))
     }
 
     // ---- detection and fingerprint ----------------------------------------
@@ -830,27 +1034,104 @@ impl Inner {
                 "BFME found"
             );
         }
-        let game_dir = info.game_dir.clone().filter(|_| info.exe.is_some());
+        let language = info
+            .registry_language
+            .as_deref()
+            .and_then(crate::mods::language_code)
+            .map(str::to_owned);
+        self.mods.set_environment(info.game_dir.clone(), language);
         self.update(Change::Game, |s| s.game = Some(info));
         self.update(Change::Hook, |s| s.hook = hook_status);
         let maps_dir = self.maps_dir();
         self.update(Change::Maps, |s| s.maps.maps_dir = maps_dir);
-        match game_dir {
-            Some(dir) if self.opts.fingerprint => self.start_fingerprint(dir),
-            Some(_) => self.update(Change::Fingerprint, |s| {
-                s.fingerprint = FingerprintState::Unavailable {
-                    reason: "disabled".into(),
-                }
-            }),
-            None => self.update(Change::Fingerprint, |s| {
-                s.fingerprint = FingerprintState::Unavailable {
-                    reason: "BFME not found".into(),
-                }
-            }),
+        self.refresh_fingerprint(true);
+    }
+
+    /// The folders BFME starts from: the instance of the lobby's configuration
+    /// (`Err` while it is not ready), else the detected installation.
+    fn launch_dirs(&self) -> Result<(PathBuf, Option<PathBuf>), String> {
+        if let Some(config) = self.mods.lobby_config() {
+            return self
+                .mods
+                .ready_instance()
+                .filter(|r| r.config_id == config.id)
+                .map(|r| (r.game_dir, r.mod_dir))
+                .ok_or_else(|| "game configuration is being prepared".to_owned());
+        }
+        let game = lock(&self.state).game.clone();
+        match game {
+            None => Err("game detection running".to_owned()),
+            Some(g) => g
+                .game_dir
+                .clone()
+                .filter(|_| g.exe.is_some())
+                .map(|d| (d, None))
+                .ok_or_else(|| "BFME not found".to_owned()),
         }
     }
 
-    fn start_fingerprint(self: &Arc<Self>, game_dir: PathBuf) {
+    /// (Re)computes the fingerprint of the folders BFME starts from, if they
+    /// changed (or always with `force`).
+    fn refresh_fingerprint(self: &Arc<Self>, force: bool) {
+        if !self.opts.fingerprint {
+            self.update(Change::Fingerprint, |s| {
+                s.fingerprint = FingerprintState::Unavailable {
+                    reason: "disabled".into(),
+                }
+            });
+            return;
+        }
+        match self.launch_dirs() {
+            Ok(target) => {
+                {
+                    let mut current = lock(&self.fp_target);
+                    if !force && current.as_ref() == Some(&target) {
+                        return;
+                    }
+                    *current = Some(target.clone());
+                }
+                self.start_fingerprint(target.0, target.1);
+            }
+            Err(reason) => {
+                *lock(&self.fp_target) = None;
+                lock(&self.fp_cancel).store(true, Ordering::Relaxed);
+                self.update(Change::Fingerprint, |s| s.fingerprint = FingerprintState::Unavailable { reason });
+            }
+        }
+    }
+
+    /// Seeds the fingerprint cache with the store's BLAKE3 hashes of a fresh
+    /// instance's files (no need to hash gigabytes again).
+    async fn seed_instance_hashes(&self, ready: &ReadyInstance) {
+        let Some(config) = self.mods.lobby_config().filter(|c| c.id == ready.config_id) else {
+            return;
+        };
+        let store_dir = self.mods.paths().store();
+        let cache = self.opts.data.cache_file();
+        let ready = ready.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let store = Store::open(&store_dir)?;
+            let files: Vec<(PathBuf, String)> = config
+                .files
+                .iter()
+                .filter_map(|f| {
+                    let base = match f.dir {
+                        beacon_proto::control::FileDir::Game => ready.game_dir.clone(),
+                        beacon_proto::control::FileDir::Mod => ready.mod_dir.clone()?,
+                    };
+                    let stored = store.get(&f.md5)?;
+                    Some((crate::mods::join_package_path(&base, &f.path), stored.blake3))
+                })
+                .collect();
+            fingerprint::seed_cache(&cache, &files)
+        })
+        .await;
+        if let Ok(Err(e)) = result {
+            debug!("cannot seed the fingerprint cache: {e}");
+        }
+    }
+
+    fn start_fingerprint(self: &Arc<Self>, game_dir: PathBuf, mod_dir: Option<PathBuf>) {
         let cancel = {
             let mut slot = lock(&self.fp_cancel);
             slot.store(true, Ordering::Relaxed);
@@ -865,7 +1146,7 @@ impl Inner {
             .name("fingerprint".into())
             .spawn(move || {
                 let mut last = std::time::Instant::now();
-                let result = fingerprint::run(&game_dir, hook.as_deref(), &cache, &cancel, &mut |p| {
+                let result = fingerprint::run_dirs(&game_dir, mod_dir.as_deref(), hook.as_deref(), &cache, &cancel, &mut |p| {
                     let done = p.files_done == p.files_total;
                     if done || last.elapsed() >= Duration::from_millis(250) {
                         last = std::time::Instant::now();
@@ -948,8 +1229,13 @@ impl Inner {
                         you_are_host: c.you_are_host,
                         relay_addr: c.relay_addr.to_string(),
                         newly_pinned: c.newly_pinned,
+                        features: c.features.clone(),
                     });
                 });
+                if !c.features.iter().any(|f| f == FEATURE_GAME_CONFIG) {
+                    // An older server: vanilla only.
+                    self.mods.set_lobby_config(None, String::new());
+                }
                 self.refresh_settings();
             }
             ControlEvent::Message(msg) => self.on_server_msg(generation, msg).await,
@@ -1063,11 +1349,16 @@ impl Inner {
                     self.notice(NoticeLevel::Info, "the host started the game");
                 }
             }
-            ServerMsg::Welcome { .. }
-            | ServerMsg::GameConfig { .. }
-            | ServerMsg::Pong { .. }
-            | ServerMsg::Kick { .. }
-            | ServerMsg::Unknown => {}
+            ServerMsg::GameConfig { config, by } => {
+                match &config {
+                    Some(c) => info!(id = %c.id, name = %c.name, version = %c.version, language = %c.language, by = %by, "lobby game configuration"),
+                    None => info!(by = %by, "lobby game configuration: vanilla"),
+                }
+                if self.generation.load(Ordering::SeqCst) == generation {
+                    self.mods.set_lobby_config(config.map(|c| Arc::new(*c)), by);
+                }
+            }
+            ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Kick { .. } | ServerMsg::Unknown => {}
         }
     }
 
@@ -1255,8 +1546,35 @@ impl Inner {
             .clone()
             .ok_or_else(|| CommandError::new(CommandErrorKind::GameNotFound, "the game detection is still running"))?;
         let not_found = || CommandError::new(CommandErrorKind::GameNotFound, "BFME was not found; set the game folder");
-        let game_dir = game.game_dir.clone().ok_or_else(not_found)?;
-        let exe = game.exe_path().ok_or_else(not_found)?;
+        let lobby_config = self.mods.lobby_config();
+        let (game_dir, exe, mod_args, instance_id) = match &lobby_config {
+            Some(config) => {
+                let ready = self
+                    .mods
+                    .ready_instance()
+                    .filter(|r| r.config_id == config.id)
+                    .ok_or_else(|| {
+                        CommandError::new(
+                            CommandErrorKind::NotReady,
+                            format!("the game configuration {} {} is not ready yet", config.name, config.version),
+                        )
+                    })?;
+                let mut args = Vec::new();
+                if let Some(m) = &ready.mod_dir {
+                    args.push("-mod".to_owned());
+                    args.push(m.to_string_lossy().into_owned());
+                }
+                let exe = ready.game_dir.join(detect::EXE_NAME);
+                (ready.game_dir, exe, args, Some(config.id.clone()))
+            }
+            None => (
+                game.game_dir.clone().ok_or_else(not_found)?,
+                game.exe_path().ok_or_else(not_found)?,
+                Vec::new(),
+                None,
+            ),
+        };
+        let launched_dir = game_dir.clone();
         let cfg = self.config.get();
         let name = self
             .our_name()
@@ -1301,10 +1619,12 @@ impl Inner {
                 }
             }
             let log = logging::hook_log_path(&logs).ok();
+            let mut args = launch_opts.args();
+            args.extend(mod_args);
             let spec = LaunchSpec {
                 exe,
                 cwd: game_dir,
-                args: launch_opts.args(),
+                args,
                 env: HookEnv {
                     agent_port,
                     token,
@@ -1326,6 +1646,7 @@ impl Inner {
         }
         let pid = child.id();
         info!(pid, "BFME started");
+        *lock(&self.launched_instance) = instance_id;
         self.status_tx.send_modify(|r| r.in_game = true);
         self.update(Change::Game, |s| {
             s.game_process = Some(GameProcess {
@@ -1337,11 +1658,11 @@ impl Inner {
             });
         });
         let hook_status = {
-            let dir = game.game_dir.clone();
+            let dir = launched_dir;
             let src = self.hook_source();
-            tokio::task::spawn_blocking(move || match (dir, src) {
-                (Some(d), Some(s)) => hook::status(&d, &s),
-                _ => HookStatus::Unknown,
+            tokio::task::spawn_blocking(move || match src {
+                Some(s) => hook::status(&dir, &s),
+                None => HookStatus::Unknown,
             })
             .await
             .unwrap_or(HookStatus::Unknown)
@@ -1398,6 +1719,56 @@ async fn pump_agent(inner: Arc<Inner>, mut stats: watch::Receiver<AgentStats>) {
             changed
         });
         inner.update(Change::Agent, |st| st.agent = s);
+    }
+}
+
+/// Forwards the mod manager's channels: the UI view, the readiness report for
+/// the server and the ready instance (fingerprint, maps folder).
+async fn pump_mods(
+    inner: Arc<Inner>,
+    mut view: watch::Receiver<ModsView>,
+    mut status: watch::Receiver<ConfigStatus>,
+    mut ready: watch::Receiver<Option<ReadyInstance>>,
+) {
+    let mut quit = inner.quit_tx.subscribe();
+    loop {
+        tokio::select! {
+            changed = view.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let v = view.borrow_and_update().clone();
+                inner.update(Change::Mods, |s| s.mods = v);
+            }
+            changed = status.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let c = status.borrow_and_update().clone();
+                inner.status_tx.send_if_modified(|r| {
+                    let changed = r.config.as_ref() != Some(&c);
+                    r.config = Some(c);
+                    changed
+                });
+            }
+            changed = ready.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let r = ready.borrow_and_update().clone();
+                if let Some(r) = &r {
+                    inner.seed_instance_hashes(r).await;
+                }
+                inner.refresh_fingerprint(false);
+                let maps_dir = inner.maps_dir();
+                inner.update(Change::Maps, |s| s.maps.maps_dir = maps_dir);
+            }
+            changed = quit.changed() => {
+                if changed.is_err() || *quit.borrow() {
+                    return;
+                }
+            }
+        }
     }
 }
 

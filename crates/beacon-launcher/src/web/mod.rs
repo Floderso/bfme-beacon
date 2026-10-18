@@ -206,6 +206,12 @@ fn router(shared: Shared) -> Router {
         .route("/password/forget", post(api::password_forget))
         .route("/name/restore", post(api::name_restore))
         .route("/logs/open", post(api::logs_open))
+        .route("/mods/select", post(api::mods_select))
+        .route("/mods/retry", post(api::mods_retry))
+        .route("/mods/cancel", post(api::mods_cancel))
+        .route("/mods/reload", post(api::mods_reload))
+        .route("/mods/import", post(api::mods_import))
+        .route("/mods/cleanup", post(api::mods_cleanup))
         .route("/quit", post(api::quit))
         .fallback(api::not_found);
     let mut site = Router::new();

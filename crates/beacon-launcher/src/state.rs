@@ -15,6 +15,7 @@ use crate::fingerprint::Progress;
 use crate::game::detect::GameInfo;
 use crate::game::hook::HookStatus;
 use crate::maps::MapState;
+use crate::mods::manager::ModsView;
 
 /// Chat lines kept.
 pub const CHAT_HISTORY: usize = 200;
@@ -49,6 +50,8 @@ pub enum Change {
     Settings,
     /// `notices`.
     Notice,
+    /// `mods` (game configuration, preparation, catalog, storage).
+    Mods,
     /// A second start asked this instance to show itself (open the UI).
     Activate,
     /// The app is shutting down.
@@ -115,6 +118,8 @@ pub struct ServerInfo {
     pub you_are_host: bool,
     /// Relay endpoint.
     pub relay_addr: String,
+    /// Optional protocol features of the server (`game_config`, …).
+    pub features: Vec<String>,
     /// The identity was pinned at this login (first connection).
     pub newly_pinned: bool,
 }
@@ -352,6 +357,9 @@ pub struct AppState {
     pub settings: SettingsView,
     /// Notices (last [`NOTICE_HISTORY`]).
     pub notices: VecDeque<Notice>,
+    /// Mod support: the lobby's game configuration, the local preparation, the
+    /// host's catalog, storage and settings.
+    pub mods: ModsView,
 }
 
 impl AppState {
@@ -416,6 +424,7 @@ mod tests {
             peer_files: BTreeMap::new(),
             settings: SettingsView::from_config(&Config::default()),
             notices: VecDeque::new(),
+            mods: ModsView::placeholder(),
         };
         for i in 0..CHAT_HISTORY + 10 {
             s.push_chat(ChatLine { from: "a".into(), text: i.to_string(), ts: 0 });

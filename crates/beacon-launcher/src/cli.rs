@@ -8,6 +8,9 @@
 //! Beacon.exe detect [OPTIONS]                JSON: game folder, exe identity, user dir, hook
 //! Beacon.exe fingerprint [OPTIONS]           JSON: game-data fingerprint and file list
 //! Beacon.exe restore-name [OPTIONS]          restore BFME's original LAN name
+//! Beacon.exe mods list [OPTIONS]             JSON: configurations from the BFME Workshop library
+//! Beacon.exe mods prepare GUID@VERSION [--language XX] [--import DIR]... [--mods-dir DIR] [OPTIONS]
+//!                                            build that configuration's instance folder (JSON)
 //! Beacon.exe stop [OPTIONS]                  ask the running instance to quit
 //! Beacon.exe version | help
 //!
@@ -74,6 +77,34 @@ pub struct ConnectArgs {
     pub yres: Option<u32>,
 }
 
+/// `mods` sub-commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModsAction {
+    /// List the configurations the BFME Workshop library offers.
+    List,
+    /// Prepare one configuration (import from the user's files, build the
+    /// instance; never downloads).
+    Prepare {
+        /// `guid@version`.
+        key: String,
+        /// `--language XX` (default: the game's language).
+        language: Option<String>,
+    },
+}
+
+/// `mods` arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModsArgs {
+    /// Shared options.
+    pub common: Common,
+    /// What to do.
+    pub action: ModsAction,
+    /// `--import DIR` (repeatable): extra folders to search.
+    pub import_dirs: Vec<PathBuf>,
+    /// `--mods-dir DIR`: store and instances (default `<data dir>\mods`).
+    pub mods_dir: Option<PathBuf>,
+}
+
 /// A parsed command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -87,6 +118,8 @@ pub enum Command {
     Fingerprint(Common),
     /// Restore the BFME LAN name.
     RestoreName(Common),
+    /// Game configurations (BFME Workshop packages).
+    Mods(ModsArgs),
     /// Ask the running instance (of `--instance`/`--data-dir`) to quit.
     Stop(Common),
     /// Version.
@@ -127,6 +160,10 @@ Usage:
   Beacon.exe detect [OPTIONS]                  game folder, exe identity, user folder, hook (JSON)
   Beacon.exe fingerprint [OPTIONS]             game-data fingerprint (JSON)
   Beacon.exe restore-name [OPTIONS]            restore BFME's original LAN name
+  Beacon.exe mods list [OPTIONS]               configurations in the BFME Workshop library (JSON)
+  Beacon.exe mods prepare GUID@VERSION [--language XX] [--import DIR]... [--mods-dir DIR] [OPTIONS]
+                                               build that configuration's instance folder from your
+                                               own files (JSON; never downloads)
   Beacon.exe stop [OPTIONS]                    ask the running instance to quit (for scripts)
   Beacon.exe version | help
 
@@ -189,12 +226,38 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
     match sub {
         "version" | "--version" => return Ok(Command::Version),
         "help" | "--help" | "-h" | "/?" => return Ok(Command::Help),
-        "" | "connect" | "detect" | "fingerprint" | "restore-name" | "stop" => {}
+        "" | "connect" | "detect" | "fingerprint" | "restore-name" | "stop" | "mods" => {}
         other => return Err(CliError(format!("unknown command {other:?} (see `Beacon.exe help`)"))),
     }
     if rest.iter().any(|a| a == "--help" || a == "-h") {
         return Ok(Command::Help);
     }
+    let mods = sub == "mods";
+    let mut mods_action = None;
+    let mut rest = rest;
+    if mods {
+        match rest.first().map(String::as_str) {
+            Some("list") => {
+                mods_action = Some(ModsAction::List);
+                rest = rest.get(1..).unwrap_or_default();
+            }
+            Some("prepare") => {
+                let key = rest
+                    .get(1)
+                    .filter(|k| !k.starts_with('-') && k.contains('@'))
+                    .ok_or_else(|| CliError("mods prepare needs GUID@VERSION".into()))?;
+                mods_action = Some(ModsAction::Prepare {
+                    key: key.clone(),
+                    language: None,
+                });
+                rest = rest.get(2..).unwrap_or_default();
+            }
+            _ => return Err(CliError("use `mods list` or `mods prepare GUID@VERSION`".into())),
+        }
+    }
+    let mut language = None;
+    let mut import_dirs = Vec::new();
+    let mut mods_dir = None;
     let mut common = Common {
         instance: 1,
         ..Common::default()
@@ -235,6 +298,15 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 flag(opt, inline)?;
                 common.no_tray = true;
             }
+            "--language" if mods => {
+                let v = it.value(opt, inline)?;
+                if !beacon_proto::control::is_valid_language(v) {
+                    return Err(CliError(format!("--language: {v:?} is not a language code like EN or DE")));
+                }
+                language = Some(v.to_owned());
+            }
+            "--import" if mods => import_dirs.push(PathBuf::from(it.value(opt, inline)?)),
+            "--mods-dir" if mods => mods_dir = Some(PathBuf::from(it.value(opt, inline)?)),
             "--server" if connect => server = Some(it.value(opt, inline)?.to_owned()),
             "--name" if connect => name = Some(it.value(opt, inline)?.to_owned()),
             "--password-stdin" | "--remembered" if connect => {
@@ -283,7 +355,11 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             }
         }
     }
-    for p in [&common.data_dir, &common.game_dir, &common.hook_dll].into_iter().flatten() {
+    for p in [&common.data_dir, &common.game_dir, &common.hook_dll, &mods_dir]
+        .into_iter()
+        .flatten()
+        .chain(import_dirs.iter())
+    {
         if !p.is_absolute() {
             return Err(CliError(format!("{} must be an absolute path", p.display())));
         }
@@ -303,6 +379,18 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
         "detect" => Command::Detect(common),
         "fingerprint" => Command::Fingerprint(common),
         "restore-name" => Command::RestoreName(common),
+        "mods" => {
+            let action = match mods_action {
+                Some(ModsAction::Prepare { key, .. }) => ModsAction::Prepare { key, language },
+                Some(ModsAction::List) | None => ModsAction::List,
+            };
+            Command::Mods(ModsArgs {
+                common,
+                action,
+                import_dirs,
+                mods_dir,
+            })
+        }
         "stop" => Command::Stop(common),
         _ => Command::Run(common),
     })
@@ -380,5 +468,35 @@ mod tests {
             assert!(p(bad).is_err(), "{bad:?}");
         }
         assert!(p(&["--bogus"]).unwrap_err().to_string().contains("--bogus"));
+    }
+
+    #[test]
+    fn mods_commands() {
+        let Command::Mods(m) = p(&["mods", "list", r"--data-dir=D:\b"]).unwrap() else { panic!() };
+        assert_eq!(m.action, ModsAction::List);
+        let Command::Mods(m) = p(&[
+            "mods", "prepare", "4ae751aa-2df4-4bfd-8ba0-1d21c3d80152@1.0.0", "--language", "DE", "--import",
+            r"C:\x", "--import", r"D:\y", "--mods-dir", r"D:\m",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            m.action,
+            ModsAction::Prepare { key: "4ae751aa-2df4-4bfd-8ba0-1d21c3d80152@1.0.0".into(), language: Some("DE".into()) }
+        );
+        assert_eq!(m.import_dirs.len(), 2);
+        assert_eq!(m.mods_dir, Some(PathBuf::from(r"D:\m")));
+        for bad in [
+            &["mods"][..],
+            &["mods", "frob"],
+            &["mods", "prepare"],
+            &["mods", "prepare", "--language", "DE"],
+            &["mods", "prepare", "x@1", "--language", "german"],
+            &["mods", "prepare", "x@1", "--import", "relative"],
+            &["detect", "--import", r"C:\x"],
+        ] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
     }
 }

@@ -58,6 +58,8 @@ pub struct Welcome {
     pub motd: String,
     /// We are the host.
     pub you_are_host: bool,
+    /// Optional protocol features of the server.
+    pub features: Vec<String>,
 }
 
 /// An authenticated connection.
@@ -189,6 +191,7 @@ impl Established {
             you_are_host: self.welcome.you_are_host,
             relay_addr: SocketAddr::new(self.peer.ip(), self.welcome.relay_port),
             newly_pinned: self.newly_pinned,
+            features: self.welcome.features.clone(),
         }
     }
 }
@@ -407,7 +410,7 @@ pub async fn connect_once(
             relay_port,
             motd,
             you_are_host,
-            ..
+            features,
         } => Welcome {
             session,
             key,
@@ -415,6 +418,7 @@ pub async fn connect_once(
             relay_port,
             motd,
             you_are_host,
+            features: features.into_iter().take(32).map(|f| f.chars().take(64).collect()).collect(),
         },
         ServerMsg::Error { code, text } => return Err(ControlError::Rejected { code, text }),
         ServerMsg::Kick { reason } => return Err(ControlError::kicked(reason)),
@@ -484,16 +488,18 @@ pub struct StatusPacer {
 }
 
 impl StatusPacer {
-    /// A new report; returns it if it should be sent now.
+    /// A new report; returns it if it should be sent now. A change of `in_game`
+    /// or of the readiness state (configuration id, state, missing files) goes
+    /// out at once; measurements and progress percentages are paced.
     pub fn offer(&mut self, r: StatusReport, now: Instant) -> Option<StatusReport> {
-        match self.last {
+        match &self.last {
             None => Some(r),
-            Some((prev, _)) if prev.in_game != r.in_game => Some(r),
-            Some((prev, _)) if prev == r => {
+            Some((prev, _)) if prev.in_game != r.in_game || config_key(prev) != config_key(&r) => Some(r),
+            Some((prev, _)) if *prev == r => {
                 self.pending = None;
                 None
             }
-            Some((_, at)) if now.saturating_duration_since(at) >= STATUS_INTERVAL => Some(r),
+            Some((_, at)) if now.saturating_duration_since(*at) >= STATUS_INTERVAL => Some(r),
             Some(_) => {
                 self.pending = Some(r);
                 None
@@ -503,8 +509,8 @@ impl StatusPacer {
 
     /// A pending report whose interval has passed.
     pub fn due(&mut self, now: Instant) -> Option<StatusReport> {
-        match (self.pending, self.last) {
-            (Some(r), Some((_, at))) if now.saturating_duration_since(at) >= STATUS_INTERVAL => Some(r),
+        match (&self.pending, &self.last) {
+            (Some(r), Some((_, at))) if now.saturating_duration_since(*at) >= STATUS_INTERVAL => Some(r.clone()),
             _ => None,
         }
     }
@@ -516,12 +522,16 @@ impl StatusPacer {
     }
 }
 
+fn config_key(r: &StatusReport) -> Option<(&str, pc::ConfigState, Option<u32>)> {
+    r.config.as_ref().map(|c| (c.id.as_str(), c.state, c.missing))
+}
+
 fn status_msg(r: StatusReport) -> ClientMsg {
     ClientMsg::Status {
         in_game: r.in_game,
         rtt_ms: r.rtt_ms,
         loss_pct: r.loss_pct,
-        config: None,
+        config: r.config,
     }
 }
 
@@ -543,8 +553,8 @@ pub async fn run(est: Established, rx: &mut mpsc::Receiver<ControlCmd>, deps: &D
     if let Some(fp) = fp {
         conn.send(&fingerprint_of(&fp)).await?;
     }
-    let report = *status_rx.borrow_and_update();
-    conn.send(&status_msg(report)).await?;
+    let report = status_rx.borrow_and_update().clone();
+    conn.send(&status_msg(report.clone())).await?;
     pacer.sent(report, Instant::now());
     conn.send(&ClientMsg::MapList).await?;
 
@@ -582,7 +592,7 @@ pub async fn run(est: Established, rx: &mut mpsc::Receiver<ControlCmd>, deps: &D
                 conn.send(&ClientMsg::Ping { ts }).await?;
                 let now = Instant::now();
                 if let Some(r) = pacer.due(now) {
-                    conn.send(&status_msg(r)).await?;
+                    conn.send(&status_msg(r.clone())).await?;
                     pacer.sent(r, now);
                 }
             },
@@ -591,10 +601,10 @@ pub async fn run(est: Established, rx: &mut mpsc::Receiver<ControlCmd>, deps: &D
                     status_open = false;
                     continue;
                 }
-                let report = *status_rx.borrow_and_update();
+                let report = status_rx.borrow_and_update().clone();
                 let now = Instant::now();
                 if let Some(r) = pacer.offer(report, now) {
-                    conn.send(&status_msg(r)).await?;
+                    conn.send(&status_msg(r.clone())).await?;
                     pacer.sent(r, now);
                 }
             },
@@ -650,6 +660,7 @@ mod tests {
             in_game,
             rtt_ms: Some(rtt),
             loss_pct: None,
+            config: None,
         };
         let mut p = StatusPacer::default();
         assert_eq!(p.offer(r(false, 10), t0), Some(r(false, 10)));
@@ -662,5 +673,33 @@ mod tests {
         p.sent(r(true, 12), t0 + Duration::from_secs(1));
         assert_eq!(p.due(t0 + Duration::from_secs(100)), None);
         assert_eq!(p.offer(r(true, 20), t0 + Duration::from_secs(7)), Some(r(true, 20)));
+    }
+
+    #[test]
+    fn readiness_pacing() {
+        use beacon_proto::control::{ConfigState, ConfigStatus};
+        let t0 = Instant::now();
+        let r = |state, progress| StatusReport {
+            in_game: false,
+            rtt_ms: None,
+            loss_pct: None,
+            config: Some(ConfigStatus {
+                id: "a".repeat(32),
+                state,
+                progress,
+                missing: None,
+                text: None,
+            }),
+        };
+        let mut p = StatusPacer::default();
+        p.sent(r(ConfigState::Preparing, Some(0)), t0);
+        let t1 = t0 + Duration::from_millis(500);
+        assert_eq!(p.offer(r(ConfigState::Preparing, Some(30)), t1), None, "progress is paced");
+        assert_eq!(p.due(t0 + STATUS_INTERVAL), Some(r(ConfigState::Preparing, Some(30))));
+        assert_eq!(
+            p.offer(r(ConfigState::Ready, None), t1),
+            Some(r(ConfigState::Ready, None)),
+            "a state change goes out at once"
+        );
     }
 }

@@ -371,6 +371,8 @@ pub struct Config {
     pub auto_launch_on_host_start: bool,
     /// Advanced redundancy overrides.
     pub redundancy: RedundancyOverrides,
+    /// Mod support: store location, import folders, workshop downloads.
+    pub mods: crate::mods::manager::ModSettings,
 }
 
 impl Default for Config {
@@ -385,6 +387,7 @@ impl Default for Config {
             name_sync: true,
             auto_launch_on_host_start: true,
             redundancy: RedundancyOverrides::default(),
+            mods: crate::mods::manager::ModSettings::default(),
         }
     }
 }
@@ -441,6 +444,7 @@ impl Config {
                 *v = None;
             }
         }
+        self.mods.sanitize();
     }
 
     /// The entry of a server.

@@ -665,6 +665,41 @@ async fn commands_validate_and_settings_are_saved() {
     check(ui.post("/api/maps/sync", &json!({})).await, 409, "not_connected", None);
     check(ui.post("/api/launch", &json!({})).await, 409, "not_connected", None);
 
+    // Game configuration (mods).
+    check(ui.post("/api/mods/select", &json!({"key": "no-version"})).await, 400, "invalid_input", Some("config_key"));
+    check(
+        ui.post("/api/mods/select", &json!({"key": "pkg@1.0", "language": "german"})).await,
+        400,
+        "invalid_input",
+        Some("language_code"),
+    );
+    check(ui.post("/api/mods/select", &json!({"key": null})).await, 409, "not_connected", None);
+    check(ui.post("/api/mods/import", &json!({"path": "relative"})).await, 400, "invalid_input", Some("path_not_absolute"));
+    check(
+        ui.post("/api/settings", &json!({"mods_dir": "relative"})).await,
+        400,
+        "invalid_input",
+        Some("path_not_absolute"),
+    );
+    check(
+        ui.post("/api/settings", &json!({"import_dirs": ["C:/ok", "rel"]})).await,
+        400,
+        "invalid_input",
+        Some("path_not_absolute"),
+    );
+    // Workshop downloads stay off until the BFME Foundation Team agrees.
+    check(ui.post("/api/settings", &json!({"workshop_downloads": true})).await, 400, "invalid_input", None);
+    for route in ["/api/mods/retry", "/api/mods/cancel", "/api/mods/reload"] {
+        assert_eq!(ui.post(route, &json!({})).await.status, 200, "{route}");
+    }
+    let r = ui.post("/api/mods/cleanup", &json!({})).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["removed"]["instances"], 0);
+    let state = ui.get("/api/state").await.json();
+    assert_eq!(state["mods"]["settings"]["workshop_available"], false);
+    assert_eq!(state["mods"]["settings"]["workshop_downloads"], false);
+    assert_eq!(state["mods"]["local"]["state"], "vanilla");
+
     // Malformed bodies.
     let host = ui.host();
     let token = ui.web.token().to_owned();
