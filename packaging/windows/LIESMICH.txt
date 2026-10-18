@@ -1,0 +1,56 @@
+BFME Beacon
+===========
+
+Mehrspieler für "Die Schlacht um Mittelerde" (BFME1) über einen eigenen Server.
+
+Du brauchst: BFME1 aus dem BFME All-in-One-Launcher mit Patch 1.06 und vom
+Betreiber des Servers die Server-Adresse und das Passwort.
+
+
+So geht's
+---------
+
+1. Diesen Ordner "Beacon" an einen Ort deiner Wahl legen, z. B. C:\Spiele\Beacon.
+   Beacon.exe und wsock32.dll müssen zusammen in einem Ordner bleiben.
+
+2. Beacon.exe starten. Dein Browser öffnet die Beacon-Seite.
+   Zeigt Windows "Der Computer wurde durch Windows geschützt"?
+   Dann auf "Weitere Informationen" und "Trotzdem ausführen" klicken.
+
+3. Server-Adresse, deinen Namen und das Passwort eingeben, "Verbinden" klicken.
+
+4. In der Lobby startet der Host alle mit "Alle starten" (oder du klickst
+   "BFME starten"). In BFME: Mehrspieler -> Netzwerk, dann dem Spiel beitreten.
+
+Wichtig: BFME immer über Beacon starten und Beacon während des Spiels laufen lassen.
+
+
+Was Beacon an deinem PC ändert
+------------------------------
+
+- Es legt vor dem Spielstart die Datei wsock32.dll in den BFME-Ordner. Ohne
+  Beacon tut sie nichts. Entfernen: BFME und Beacon beenden, dann wsock32.dll im
+  BFME-Ordner löschen.
+- Es setzt deinen LAN-Namen in BFME (Network.ini) auf deinen Beacon-Namen.
+  Zurück: Einstellungen -> "Ursprünglichen Namen wiederherstellen".
+- Einstellungen und Logs liegen in %APPDATA%\Beacon.
+
+
+Hilfe und ausführliche Anleitung
+--------------------------------
+
+Anleitung:  https://github.com/Floderso/bfme-beacon/blob/main/docs/anleitung/spielen.md
+Probleme:   https://github.com/Floderso/bfme-beacon/blob/main/docs/anleitung/fehlerbehebung.md
+
+Smart App Control blockiert Beacon? Das liegt daran, dass Beacon noch nicht
+digital signiert ist. Details stehen unter "Probleme" (Link oben).
+
+
+Lizenz
+------
+
+BFME Beacon ist freie Software unter der GNU General Public License, Version 3
+oder neuer (siehe LICENSE.txt). Quellcode: https://github.com/Floderso/bfme-beacon
+
+Beacon ist ein inoffizielles Fan-Projekt und steht in keiner Verbindung zu
+Electronic Arts. Es enthält keine Spieldateien.

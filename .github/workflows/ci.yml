@@ -1,0 +1,112 @@
+# Build, test and lint on every branch push and pull request.
+# Also called by release.yml before a release is built (workflow_call).
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  windows:
+    name: Windows (launcher, hook, proto, server)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable, x86_64-pc-windows-gnullvm host, i686 target)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install stable-x86_64-pc-windows-gnullvm --profile minimal --component clippy --target i686-pc-windows-gnullvm --force-non-host --no-self-update
+          rustup default stable-x86_64-pc-windows-gnullvm
+          rustc -Vv
+          cargo -V
+
+      - name: Install llvm-mingw (pinned release, SHA-256 verified)
+        run: ./.github/scripts/setup-llvm-mingw.ps1
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build the hook DLL (cargo hook)
+        run: cargo hook --locked
+
+      - name: Check the hook's exports against SysWOW64\wsock32.dll
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --disable-pip-version-check pefile==2024.8.26
+          python crates/beacon-hook/tools/check_exports.py target/i686-pc-windows-gnullvm/release-hook/wsock32.dll
+
+      - name: Test (x86_64)
+        run: cargo test --locked -p beacon-proto -p beacon-server -p beacon-launcher -p beacon-hook
+
+      - name: Test beacon-proto without default features
+        run: cargo test --locked -p beacon-proto --no-default-features
+
+      - name: Test beacon-hook (i686)
+        run: cargo test --locked -p beacon-hook --target i686-pc-windows-gnullvm
+
+      - name: Hook harness (32-bit, against the cargo hook output)
+        run: cargo hook-harness
+
+      - name: Clippy (x86_64, whole workspace)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Clippy (i686, hook and harness)
+        run: cargo clippy --locked -p beacon-hook -p beacon-hook-harness --target i686-pc-windows-gnullvm --all-targets -- -D warnings
+
+  linux:
+    name: Linux (proto, server, static musl build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable, musl target)
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target x86_64-unknown-linux-musl --no-self-update
+          rustup default stable
+          rustc -Vv
+          cargo -V
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Test beacon-proto and beacon-server
+        run: cargo test --locked -p beacon-proto -p beacon-server
+
+      - name: Test beacon-proto without default features
+        run: cargo test --locked -p beacon-proto --no-default-features
+
+      - name: Clippy (Linux code paths)
+        run: cargo clippy --locked -p beacon-proto -p beacon-server --all-targets -- -D warnings
+
+      - name: Build beacon-server (static, x86_64-unknown-linux-musl)
+        run: cargo build --locked --release -p beacon-server --target x86_64-unknown-linux-musl
+
+      - name: Check that the server binary is static and runs
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/beacon-server
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          "$bin" version
