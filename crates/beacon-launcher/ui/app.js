@@ -234,7 +234,11 @@
   };
 
   const REJECTED = {
-    name_taken: 'Dieser Spielername ist auf dem Server bereits vergeben. Wähle einen anderen Namen.',
+    // Also what a reconnect sees while the server still holds the player's broken
+    // connection (up to 30 s): a new name would mean a new virtual IP, which a
+    // running BFME cannot follow – so no advice to change it while retrying.
+    name_taken:
+      'Der Spielername ist auf dem Server gerade belegt – von einem anderen Spieler oder von deiner eigenen, eben abgebrochenen Verbindung (der Server gibt sie nach spätestens 30 s frei). Beacon versucht es weiter; läuft BFME, bitte den Namen nicht ändern.',
     bad_name: 'Der Server lehnt diesen Spielernamen ab.',
     server_full: 'Der Server ist voll.',
     unsupported_version: 'Diese Beacon-Version wird vom Server nicht unterstützt. Bitte Beacon aktualisieren.',
