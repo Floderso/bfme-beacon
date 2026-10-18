@@ -40,14 +40,19 @@ getrandom = "0.3.4"
 axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json"] }
 # Only the `Stream` trait for the SSE body (already in axum's graph, no build script).
 futures-core = { version = "0.3.34", default-features = false }
+# MD5 for the BFME Workshop's content addresses (RustCrypto, pure Rust; its
+# `digest` dependency is already in the graph through argon2/blake2).
+md-5 = { version = "0.10.6", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI, SHA-256 (CNG), registry, named mutex, console attach, opening the
-# browser/Explorer (ShellExecuteW) and the tray icon. Already in the dependency
+# browser/Explorer (ShellExecuteW), the tray icon, free disk space and WinHTTP
+# (workshop downloads: the system's TLS stack and proxy, no ring/openssl). Already in the dependency
 # graph through tokio/socket2/getrandom (raw-dylib, no import libs).
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",

@@ -18,7 +18,7 @@ use windows_sys::Win32::Security::Cryptography::{
     CryptUnprotectData, BCRYPT_HASH_HANDLE, BCRYPT_SHA256_ALG_HANDLE, CRYPTPROTECT_UI_FORBIDDEN,
     CRYPT_INTEGER_BLOB,
 };
-use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_UNKNOWN};
+use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetFileType, FILE_TYPE_UNKNOWN};
 use windows_sys::Win32::System::Console::{
     AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE,
@@ -370,6 +370,28 @@ fn shell_open(target: &OsStr) -> io::Result<()> {
         Ok(())
     } else {
         Err(io::Error::other(format!("ShellExecuteW failed (code {code})")))
+    }
+}
+
+/// Bytes available to the current user on the volume of `path` (an existing
+/// folder or file).
+pub fn free_space(path: &Path) -> io::Result<u64> {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no folder"))?
+    };
+    let name: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut available: u64 = 0;
+    // SAFETY: `name` is NUL-terminated UTF-16 that outlives the call; the other two
+    // outputs may be null.
+    let ok = unsafe { GetDiskFreeSpaceExW(name.as_ptr(), &mut available, ptr::null_mut(), ptr::null_mut()) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(available)
     }
 }
 

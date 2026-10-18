@@ -4,7 +4,7 @@
 use std::io;
 use std::path::Path;
 
-use super::{Hive, TrayCommand, SHA256_LEN};
+use super::{Hive, HttpRequestSpec, RawHttpResponse, TrayCommand, SHA256_LEN};
 
 fn unsupported() -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, "only available on Windows")
@@ -75,4 +75,14 @@ impl Tray {
     pub fn start(_tooltip: &str, _callback: impl Fn(TrayCommand) + Send + 'static) -> io::Result<Self> {
         Err(unsupported())
     }
+}
+
+/// Not available: the free-space check is skipped.
+pub fn free_space(_path: &Path) -> io::Result<u64> {
+    Err(unsupported())
+}
+
+/// Not available: the BFME Workshop client uses WinHTTP.
+pub fn http_get(_spec: &HttpRequestSpec<'_>) -> io::Result<RawHttpResponse> {
+    Err(unsupported())
 }

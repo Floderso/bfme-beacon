@@ -9,15 +9,68 @@
 //! * Attaching to the parent console for the CLI modes of the GUI-subsystem exe.
 //! * Opening the browser / Explorer (`ShellExecuteW`) for the web UI.
 //! * The notification-area icon ([`Tray`], `Shell_NotifyIconW`).
+//! * Free disk space (`GetDiskFreeSpaceExW`) and HTTP(S) `GET` over WinHTTP
+//!   (`winhttp.rs`, the BFME Workshop client of `mods`).
 
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+mod winhttp;
+#[cfg(windows)]
 pub use self::tray::{icon_pixels, Tray, ICON_SIZE};
 #[cfg(windows)]
 pub use self::windows::*;
+#[cfg(windows)]
+pub use self::winhttp::http_get;
+
+/// One HTTP `GET` for [`http_get`].
+#[derive(Debug, Clone, Copy)]
+pub struct HttpRequestSpec<'a> {
+    /// `https` (TLS) or plain `http`.
+    pub secure: bool,
+    /// Host name or IP literal (without brackets).
+    pub host: &'a str,
+    /// TCP port.
+    pub port: u16,
+    /// Path and query, starting with `/`, already escaped.
+    pub path: &'a str,
+    /// `User-Agent`.
+    pub user_agent: &'a str,
+    /// Extra request headers.
+    pub headers: &'a [(String, String)],
+    /// Use the system's proxy configuration (else connect directly).
+    pub system_proxy: bool,
+    /// Timeout for resolving, connecting, sending and each receive (ms).
+    pub timeout_ms: i32,
+}
+
+/// What [`http_get`] returns: the status, the raw headers Beacon uses and the body.
+pub struct RawHttpResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// `Content-Length`.
+    pub content_length: Option<String>,
+    /// `Content-Range`.
+    pub content_range: Option<String>,
+    /// `Retry-After`.
+    pub retry_after: Option<String>,
+    /// `Content-Encoding`.
+    pub content_encoding: Option<String>,
+    /// The body, read in pieces.
+    pub body: Box<dyn std::io::Read + Send>,
+}
+
+impl std::fmt::Debug for RawHttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawHttpResponse")
+            .field("status", &self.status)
+            .field("content_length", &self.content_length)
+            .field("content_range", &self.content_range)
+            .finish_non_exhaustive()
+    }
+}
 
 /// A choice in the tray icon's menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

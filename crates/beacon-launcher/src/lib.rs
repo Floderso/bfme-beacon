@@ -9,6 +9,8 @@
 //! * [`game`] – BFME detection, exe identity, hook DLL install, Network.ini name,
 //!   test-mode user folders, starting the game.
 //! * [`fingerprint`], [`maps`] – game-data fingerprint and map sync.
+//! * [`mods`] – lobby game configurations (BFME Workshop packages): store,
+//!   instance folders, import, workshop client, preparation.
 //! * [`config`], [`paths`], [`instance`], [`logging`], [`cli`] – settings and pins,
 //!   data folder layout, single instance + handover, logs, command line.
 //! * [`web`] – the browser UI: axum on `127.0.0.1` (token, Host/Origin checks),
@@ -41,6 +43,7 @@ pub mod game;
 pub mod instance;
 pub mod logging;
 pub mod maps;
+pub mod mods;
 pub mod paths;
 pub mod state;
 pub mod sys;
