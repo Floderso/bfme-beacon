@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use beacon_proto::control::{
-    is_safe_file_name, is_safe_rel_path, Chunk, Error as ControlError, ErrorCode, Player,
-    ServerHello, ServerMsg,
+    is_safe_file_name, is_safe_rel_path, Chunk, ConfigStatus, Error as ControlError, ErrorCode,
+    GameConfig, Player, ServerHello, ServerMsg,
 };
 use beacon_proto::fingerprint::{self, FileEntry};
 use beacon_proto::relay::{RelayKey, KEY_LEN};
@@ -34,6 +34,9 @@ pub const CHAT_HISTORY_LEN: usize = 20;
 pub const LAUNCH_COOLDOWN: Duration = Duration::from_secs(10);
 /// Maximum number of fingerprint entries stored per player.
 pub const MAX_FINGERPRINT_FILES: usize = 8192;
+/// Minimum time between two game-configuration changes (each one is a large
+/// message to every player).
+pub const CONFIG_COOLDOWN: Duration = Duration::from_secs(2);
 const CHUNK_READERS: usize = 4;
 const VERSION_MAX: usize = 32;
 const MAX_REPORTED_RTT_MS: u32 = 60_000;
@@ -74,6 +77,40 @@ impl LobbyView {
     }
 }
 
+/// The lobby's game configuration as sent to every connection (pre-encoded once).
+#[derive(Debug)]
+pub struct ConfigView {
+    /// The configuration; `None` = vanilla.
+    pub config: Option<Arc<GameConfig>>,
+    /// Who set it (empty for the start-up state).
+    pub by: String,
+    /// `{"t":"game_config",…}` JSON.
+    pub json: Arc<[u8]>,
+}
+
+impl ConfigView {
+    fn new(config: Option<Arc<GameConfig>>, by: String) -> Result<Self, ControlError> {
+        let json = (ServerMsg::GameConfig {
+            config: config.as_deref().cloned().map(Box::new),
+            by: by.clone(),
+        })
+        .to_json()?;
+        Ok(Self {
+            config,
+            by,
+            json: json.into(),
+        })
+    }
+
+    fn vanilla() -> Self {
+        Self::new(None, String::new()).unwrap_or_else(|_| Self {
+            config: None,
+            by: String::new(),
+            json: Arc::from(&br#"{"t":"game_config","config":null,"by":""}"#[..]),
+        })
+    }
+}
+
 /// Monotonic counters for `/status`.
 #[derive(Debug, Default)]
 pub struct Counters {
@@ -110,6 +147,7 @@ pub(crate) struct HubState {
     pub(crate) conns: HashMap<u64, ConnHandle>,
     chat_history: VecDeque<Arc<[u8]>>,
     last_launch: Option<Instant>,
+    last_config_change: Option<Instant>,
 }
 
 /// Everything [`Hub::new`] needs.
@@ -140,6 +178,7 @@ pub struct Hub {
     hello_line: Arc<[u8]>,
     pub(crate) state: Mutex<HubState>,
     lobby_tx: watch::Sender<Arc<LobbyView>>,
+    config_tx: watch::Sender<Arc<ConfigView>>,
     events_tx: broadcast::Sender<Arc<[u8]>>,
     relay: RelayHandle,
     pub(crate) relay_stats: watch::Receiver<Arc<RelayStats>>,
@@ -174,6 +213,8 @@ pub struct Joined {
     pub kick_rx: watch::Receiver<Option<String>>,
     /// Lobby updates.
     pub lobby_rx: watch::Receiver<Arc<LobbyView>>,
+    /// Game-configuration updates.
+    pub config_rx: watch::Receiver<Arc<ConfigView>>,
     /// Chat lines and launch commands.
     pub events_rx: broadcast::Receiver<Arc<[u8]>>,
     /// Recent chat lines to replay.
@@ -249,6 +290,7 @@ impl Hub {
             ..GuardConfig::default()
         });
         let (lobby_tx, _) = watch::channel(Arc::new(LobbyView::empty()));
+        let (config_tx, _) = watch::channel(Arc::new(ConfigView::vanilla()));
         let (events_tx, _) = broadcast::channel(EVENT_QUEUE_LEN);
         Ok(Arc::new(Self {
             settings,
@@ -258,8 +300,10 @@ impl Hub {
                 conns: HashMap::new(),
                 chat_history: VecDeque::new(),
                 last_launch: None,
+                last_config_change: None,
             }),
             lobby_tx,
+            config_tx,
             events_tx,
             relay: init.relay,
             relay_stats: init.relay_stats,
@@ -395,6 +439,7 @@ impl Hub {
         // Subscribing under the lock keeps history and live events consistent.
         let events_rx = self.events_tx.subscribe();
         let lobby_rx = self.lobby_tx.subscribe();
+        let config_rx = self.config_tx.subscribe();
         let history = st.chat_history.iter().cloned().collect();
         drop(st);
 
@@ -419,6 +464,7 @@ impl Hub {
             is_host,
             kick_rx,
             lobby_rx,
+            config_rx,
             events_rx,
             history,
         })
@@ -510,22 +556,113 @@ impl Hub {
         self.publish_lobby_locked(&st);
     }
 
-    /// Updates game state and the agent's relay measurements. A change of
-    /// `in_game` is published at once; new measurements (which launchers report
-    /// continuously) go out with the periodic lobby refresh, so that N players
-    /// reporting every second do not cause N² full lobby messages per second.
-    pub fn set_status(&self, id: u64, in_game: bool, rtt_ms: Option<u32>, loss_pct: Option<u8>) {
+    /// Updates game state, the agent's relay measurements and the readiness for
+    /// the game configuration. A change of `in_game` or of the readiness state
+    /// is published at once; new measurements and progress percentages (which
+    /// launchers report continuously) go out with the periodic lobby refresh, so
+    /// that N players reporting every second do not cause N² full lobby messages
+    /// per second.
+    pub fn set_status(
+        &self,
+        id: u64,
+        in_game: bool,
+        rtt_ms: Option<u32>,
+        loss_pct: Option<u8>,
+        config: Option<ConfigStatus>,
+    ) {
         let mut st = lock(&self.state);
         let Some(m) = st.lobby.member_mut(id) else {
             return;
         };
-        let state_changed = m.in_game != in_game;
+        let config = config.and_then(ConfigStatus::sanitized);
+        let config_changed = match (&m.config, &config) {
+            (None, None) => false,
+            (Some(a), Some(b)) => a.id != b.id || a.state != b.state || a.missing != b.missing,
+            _ => true,
+        };
+        let state_changed = m.in_game != in_game || config_changed;
         m.in_game = in_game;
         m.reported_rtt_ms = rtt_ms.map(|r| r.min(MAX_REPORTED_RTT_MS));
         m.reported_loss_pct = loss_pct.map(|l| l.min(100));
+        m.config = config;
         if state_changed {
             self.publish_lobby_locked(&st);
         }
+    }
+
+    /// Host action: sets the lobby's game configuration (`None` = vanilla). The
+    /// configuration is validated, stored and sent to every player; every ready
+    /// flag and readiness report is reset.
+    pub fn set_game_config(&self, id: u64, config: Option<Box<GameConfig>>) -> Result<(), Reject> {
+        if let Some(c) = &config {
+            c.validate().map_err(|e| {
+                reject(
+                    ErrorCode::BadRequest,
+                    format!("Ungültige Spielkonfiguration ({e})."),
+                )
+            })?;
+        }
+        let now = Instant::now();
+        let mut st = lock(&self.state);
+        if !st.lobby.is_host(id) {
+            return Err(reject(
+                ErrorCode::NotHost,
+                "Nur der Host kann die Spielversion wählen.",
+            ));
+        }
+        let host = st
+            .lobby
+            .member(id)
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        let current = self.config_tx.borrow().config.clone();
+        if current.as_deref() == config.as_deref() {
+            return Ok(());
+        }
+        if st
+            .last_config_change
+            .is_some_and(|t| now.saturating_duration_since(t) < CONFIG_COOLDOWN)
+        {
+            return Err(reject(
+                ErrorCode::RateLimited,
+                "Die Spielversion wurde gerade erst geändert; bitte kurz warten.",
+            ));
+        }
+        let config: Option<Arc<GameConfig>> = config.map(|c| Arc::new(*c));
+        let view = ConfigView::new(config.clone(), host.clone()).map_err(|_| {
+            reject(
+                ErrorCode::BadRequest,
+                "Die Spielkonfiguration ist zu groß für eine Nachricht.",
+            )
+        })?;
+        st.last_config_change = Some(now);
+        st.lobby.reset_readiness();
+        // Sent under the lock: a player joining now gets either the old
+        // configuration and then this change, or this one.
+        self.config_tx.send_replace(Arc::new(view));
+        self.publish_lobby_locked(&st);
+        drop(st);
+        let text = match &config {
+            Some(c) => {
+                info!(host, id = %c.id, guid = %c.guid, version = %c.version, language = %c.language,
+                      files = c.files.len(), "game configuration set");
+                format!(
+                    "{host} hat die Spielversion gewählt: {} {} ({}).",
+                    c.name, c.version, c.language
+                )
+            }
+            None => {
+                info!(host, "game configuration reset to vanilla");
+                format!("{host} hat die Spielversion auf „Vanilla (eigene Installation)“ zurückgesetzt.")
+            }
+        };
+        self.notice(text);
+        Ok(())
+    }
+
+    /// The current game configuration (`None` = vanilla).
+    pub fn game_config(&self) -> Arc<ConfigView> {
+        Arc::clone(&self.config_tx.borrow())
     }
 
     /// Stores a player's fingerprint file list; a complete list also updates the
@@ -581,6 +718,21 @@ impl Hub {
                 ErrorCode::RateLimited,
                 "Das Spiel wurde gerade erst gestartet; bitte kurz warten.",
             ));
+        }
+        let config = self.config_tx.borrow().config.clone();
+        if let Some(config) = config {
+            let waiting = st.lobby.not_ready_for(&config.id);
+            if !waiting.is_empty() {
+                return Err(reject(
+                    ErrorCode::NotReady,
+                    format!(
+                        "Noch nicht alle sind für „{} {}“ bereit: {}.",
+                        config.name,
+                        config.version,
+                        waiting.join(", ")
+                    ),
+                ));
+            }
         }
         st.last_launch = Some(now);
         let host = st

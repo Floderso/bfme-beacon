@@ -11,6 +11,21 @@ Home server of BFME Beacon (contract: `docs/dev/architecture.md` §6, §7, §8 m
   rejoin ban), fingerprint lists, map list and 32 KiB chunk downloads, ping/pong.
   Timeouts: handshake 10 s, idle 30 s, writes 10 s. Failed handshakes ban the IP
   with exponential backoff. Per-IP limits treat an IPv6 /64 as one address.
+* **Game configuration** (`docs/dev/mods.md`) – `welcome.features` announces
+  `game_config`. The host sets the lobby's BFME1 package configuration with
+  `set_game_config` (`null` = vanilla); the server validates it with
+  `GameConfig::validate` (≤ 512 files, safe normalised paths, MD5s, sizes, texts,
+  the id must match the file set), refuses changes more often than every 2 s,
+  keeps it **in memory only** (a restarted server is back at vanilla; the host
+  selects again) and sends `game_config{config, by}` to every player after the
+  login and after each change, plus a chat notice. A change clears every ready
+  flag and readiness report. Players report their readiness in `status.config`
+  (sanitised: id, state, progress ≤ 100, text ≤ 200 characters); the lobby shows
+  it per player (`players[].config`; state changes at once, percentages with the
+  periodic refresh). `launch_all` is refused with `not_ready` and a German list
+  of who is not ready until every player reports `ready` for the current
+  configuration's id. `/status` shows `server.game_config` and
+  `players[].config`.
 * **Relay (UDP)** – one task owns every session (key, replay window, send counter,
   registered vports, endpoint updated only after a valid tag). Unicast to the
   owner of the destination vIP, broadcast to every other session with that vport,
@@ -56,7 +71,9 @@ cargo clippy -p beacon-server --all-targets -- -D warnings
 ```
 
 `tests/server.rs` starts the real server on `127.0.0.1:0` and drives it with fake
-clients built from `beacon-proto` (login, lobby, chat, host actions, relay unicast,
+clients built from `beacon-proto` (login, lobby, chat, host actions, game
+configuration: validation, broadcast, cool-down, readiness gating of `launch_all`
+and the reset on a change, relay unicast,
 broadcast, redundancy, replay, spoofing, NAT rebinding, rate limits, garbage
 input, maps with BLAKE3 check, status, shutdown, vIP persistence). Set
 `BEACON_TEST_LOG=1` for server logs.

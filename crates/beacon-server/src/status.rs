@@ -12,6 +12,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use beacon_proto::control::ConfigStatus;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -62,6 +63,29 @@ pub struct ServerStatus {
     pub players: usize,
     /// Current host.
     pub host: Option<String>,
+    /// The lobby's game configuration (`None` = vanilla).
+    pub game_config: Option<GameConfigStatus>,
+}
+
+/// The lobby's game configuration (summary).
+#[derive(Debug, Serialize)]
+pub struct GameConfigStatus {
+    /// Configuration id.
+    pub id: String,
+    /// Package guid.
+    pub guid: String,
+    /// Package version.
+    pub version: String,
+    /// Display name.
+    pub name: String,
+    /// Language variant.
+    pub language: String,
+    /// Number of files.
+    pub files: usize,
+    /// Sum of the known file sizes.
+    pub total_size: u64,
+    /// Who set it.
+    pub set_by: String,
 }
 
 /// One player.
@@ -95,6 +119,8 @@ pub struct PlayerStatus {
     pub session: String,
     /// Relay statistics of the session.
     pub relay: Option<SessionStats>,
+    /// Readiness for the game configuration.
+    pub config: Option<ConfigStatus>,
 }
 
 /// Control channel counters.
@@ -142,6 +168,7 @@ pub fn status_doc(hub: &Hub) -> StatusDoc {
     let relay = Arc::clone(&hub.relay_stats.borrow());
     let repo = hub.map_repo();
     let lobby = hub.lobby_view();
+    let config = hub.game_config();
     let settings = hub.settings();
     let now = Instant::now();
     let (players, host) = {
@@ -173,6 +200,7 @@ pub fn status_doc(hub: &Hub) -> StatusDoc {
                 peer: st.conns.get(&id).map(|c| c.peer.to_string()),
                 session: format!("{:08x}", m.session),
                 relay: relay.sessions.get(&m.session).cloned(),
+                config: m.config.clone(),
             })
             .collect::<Vec<_>>();
         (players, host)
@@ -193,6 +221,16 @@ pub fn status_doc(hub: &Hub) -> StatusDoc {
             max_players: settings.max_players,
             players: players.len(),
             host,
+            game_config: config.config.as_ref().map(|c| GameConfigStatus {
+                id: c.id.clone(),
+                guid: c.guid.clone(),
+                version: c.version.clone(),
+                name: c.name.clone(),
+                language: c.language.clone(),
+                files: c.files.len(),
+                total_size: c.total_size(),
+                set_by: config.by.clone(),
+            }),
         },
         players,
         relay: relay.totals.clone(),

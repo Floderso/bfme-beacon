@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beacon_proto::control::{
-    encode_frame, noise_builder, ClientMsg, ErrorCode, FrameDecoder, ServerMsg, MAX_FRAME_LEN,
-    NOISE_MAX_MSG_LEN,
+    encode_frame, noise_builder, ClientMsg, ErrorCode, FrameDecoder, ServerMsg,
+    FEATURE_GAME_CONFIG, MAX_FRAME_LEN, NOISE_MAX_MSG_LEN,
 };
 use beacon_proto::snow::TransportState;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -388,20 +388,23 @@ async fn handle_connection(
         relay_port: hub.relay_port(),
         motd: hub.settings().motd.clone(),
         you_are_host: joined.is_host,
-        features: Vec::new(),
+        features: vec![FEATURE_GAME_CONFIG.to_owned()],
     };
     let crate::hub::Joined {
         id,
         mut kick_rx,
         mut lobby_rx,
+        mut config_rx,
         mut events_rx,
         history,
         ..
     } = joined;
     let lobby_json = Arc::clone(&lobby_rx.borrow_and_update().json);
+    let config_json = Arc::clone(&config_rx.borrow_and_update().json);
     let greeting = async {
         conn.send(&welcome).await?;
         conn.send_json(&lobby_json).await?;
+        conn.send_json(&config_json).await?;
         for line in &history {
             conn.send_json(line).await?;
         }
@@ -488,6 +491,15 @@ async fn handle_connection(
                     return;
                 }
             }
+            changed = config_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let json = Arc::clone(&config_rx.borrow_and_update().json);
+                if conn.send_json(&json).await.is_err() {
+                    return;
+                }
+            }
             event = events_rx.recv() => match event {
                 Ok(json) => {
                     if conn.send_json(&json).await.is_err() {
@@ -570,12 +582,13 @@ async fn handle_msg(
             in_game,
             rtt_ms,
             loss_pct,
-            ..
+            config,
         } => {
-            hub.set_status(id, in_game, rtt_ms, loss_pct);
+            hub.set_status(id, in_game, rtt_ms, loss_pct, config);
             Ok(())
         }
-        ClientMsg::SetGameConfig { .. } | ClientMsg::Unknown => {
+        ClientMsg::SetGameConfig { config } => hub.set_game_config(id, config),
+        ClientMsg::Unknown => {
             debug!("ignoring an unknown message type");
             Ok(())
         }

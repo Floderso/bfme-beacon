@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beacon_proto::control::Player;
+use beacon_proto::control::{ConfigStatus, Player};
 use beacon_proto::fingerprint::FileEntry;
 use beacon_proto::net::{self, VipAllocator};
 
@@ -274,6 +274,8 @@ pub struct Member {
     pub reported_rtt_ms: Option<u32>,
     /// Loss reported by the agent.
     pub reported_loss_pct: Option<u8>,
+    /// Readiness for the game configuration (as reported, sanitised).
+    pub config: Option<ConfigStatus>,
     /// Join time.
     pub joined_at: Instant,
 }
@@ -396,6 +398,7 @@ impl Lobby {
                 in_game: false,
                 reported_rtt_ms: None,
                 reported_loss_pct: None,
+                config: None,
                 joined_at: now,
             },
         );
@@ -513,7 +516,45 @@ impl Lobby {
                 ready: m.ready,
                 in_game: m.in_game,
                 is_host: self.host == Some(*id),
-                config: None,
+                config: m.config.clone(),
+            })
+            .collect()
+    }
+
+    /// A new game configuration: every ready flag and readiness report is
+    /// cleared (players report again for the new configuration).
+    pub fn reset_readiness(&mut self) {
+        for m in self.members.values_mut() {
+            m.ready = false;
+            m.config = None;
+        }
+    }
+
+    /// Players that are not ready for the configuration `id`, with the reason
+    /// in German (for the host's `launch_all`).
+    pub fn not_ready_for(&self, id: &str) -> Vec<String> {
+        use beacon_proto::control::ConfigState;
+        self.members
+            .values()
+            .filter(|m| !m.config.as_ref().is_some_and(|c| c.is_ready_for(id)))
+            .map(|m| {
+                let why = match &m.config {
+                    None => "keine Rückmeldung – Beacon zu alt oder noch nicht verbunden".to_owned(),
+                    Some(c) if c.id != id => "prüft die neue Spielversion".to_owned(),
+                    Some(c) => match c.state {
+                        ConfigState::Preparing => match c.progress {
+                            Some(p) => format!("bereitet vor, {p} %"),
+                            None => "bereitet vor".to_owned(),
+                        },
+                        ConfigState::Missing => match c.missing {
+                            Some(n) => format!("{n} Datei(en) fehlen"),
+                            None => "Dateien fehlen".to_owned(),
+                        },
+                        ConfigState::Error => "Fehler beim Vorbereiten".to_owned(),
+                        ConfigState::Ready | ConfigState::Unknown => "unbekannter Zustand".to_owned(),
+                    },
+                };
+                format!("{} ({why})", m.name)
             })
             .collect()
     }
@@ -733,5 +774,36 @@ mod tests {
         assert_eq!(players[0].rtt_ms, Some(42));
         assert_eq!(players[0].loss_pct, Some(19));
         assert!(players[0].ready && players[0].is_host);
+    }
+
+    #[test]
+    fn readiness_for_a_configuration() {
+        use beacon_proto::control::{ConfigState, ConfigStatus};
+        let t = Instant::now();
+        let mut l = Lobby::new(8, &[], Duration::ZERO);
+        let id = "a".repeat(32);
+        let a = l.join(req("Frodo", 1), t).unwrap();
+        let b = l.join(req("Sam", 2), t).unwrap();
+        let c = l.join(req("Merry", 3), t).unwrap();
+        l.join(req("Pippin", 4), t).unwrap();
+        l.member_mut(a.id).unwrap().config = Some(ConfigStatus::ready(id.clone()));
+        l.member_mut(a.id).unwrap().ready = true;
+        l.member_mut(b.id).unwrap().config = Some(ConfigStatus {
+            id: id.clone(),
+            state: ConfigState::Preparing,
+            progress: Some(40),
+            missing: None,
+            text: None,
+        });
+        l.member_mut(c.id).unwrap().config = Some(ConfigStatus::vanilla());
+        let not_ready = l.not_ready_for(&id);
+        assert_eq!(not_ready.len(), 3, "{not_ready:?}");
+        assert!(not_ready[0].starts_with("Sam (bereitet vor, 40 %"));
+        assert!(not_ready[1].starts_with("Merry (prüft"));
+        assert!(not_ready[2].starts_with("Pippin (keine Rückmeldung"));
+        assert_eq!(l.players(|_| None)[0].config, Some(ConfigStatus::ready(id.clone())));
+        l.reset_readiness();
+        assert!(l.players(|_| None).iter().all(|p| p.config.is_none() && !p.ready));
+        assert_eq!(l.not_ready_for(&id).len(), 4);
     }
 }

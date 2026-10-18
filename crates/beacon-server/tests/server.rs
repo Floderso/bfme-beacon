@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use beacon_proto::blake3;
 use beacon_proto::control::{
-    derive_psk, encode_frame, hello_line_len, noise_builder, ClientMsg, ErrorCode, FrameDecoder,
-    KdfParams, MapInfo, Player, ServerHello, ServerMsg, CHUNK_MAX, NOISE_MAX_MSG_LEN, PSK_LEN,
+    derive_psk, encode_frame, hello_line_len, noise_builder, ClientMsg, ConfigFile, ConfigState,
+    ConfigStatus, ErrorCode, FileDir, FrameDecoder, GameConfig, KdfParams, MapInfo, Player,
+    ServerHello, ServerMsg, CHUNK_MAX, FEATURE_GAME_CONFIG, NOISE_MAX_MSG_LEN, PSK_LEN,
 };
 use beacon_proto::fingerprint::{self, FileEntry};
 use beacon_proto::net::{SERVER_VIP, VSUBNET_BROADCAST};
@@ -21,6 +22,7 @@ use beacon_proto::relay::{
 };
 use beacon_proto::snow::TransportState;
 use beacon_server::config::{Config, Settings};
+use beacon_server::hub::CONFIG_COOLDOWN;
 use beacon_server::{hexfmt, RunningServer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -279,6 +281,7 @@ struct Client {
     vip: Ipv4Addr,
     is_host: bool,
     motd: String,
+    features: Vec<String>,
     relay_port: u16,
     udp: UdpSocket,
     relay_addr: SocketAddr,
@@ -323,7 +326,7 @@ impl Client {
                 relay_port,
                 motd,
                 you_are_host,
-                ..
+                features,
             } => Ok(Self {
                 name: name.into(),
                 stream,
@@ -334,6 +337,7 @@ impl Client {
                 vip,
                 is_host: you_are_host,
                 motd,
+                features,
                 relay_port,
                 udp: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
                 relay_addr,
@@ -1459,4 +1463,205 @@ async fn sticky_vips_survive_a_restart() {
     assert_eq!(m.vip, vip(4));
     srv.shutdown().await;
     drop(b);
+}
+
+// ---------------------------------------------------------------------------
+// Game configuration ("Spielversion / Mod")
+// ---------------------------------------------------------------------------
+
+fn game_config(tag: char) -> GameConfig {
+    GameConfig {
+        id: String::new(),
+        guid: "official-0".into(),
+        version: "7.0.5".into(),
+        name: "Patch 2.22".into(),
+        author: "The 2.22 Team".into(),
+        language: "EN".into(),
+        layers: Vec::new(),
+        files: vec![
+            ConfigFile {
+                path: "_patch222.big".into(),
+                md5: tag.to_string().repeat(32),
+                size: 82_445_787,
+                dir: FileDir::Game,
+            },
+            ConfigFile {
+                path: "lotrbfme.exe".into(),
+                md5: "0".repeat(32),
+                size: 0,
+                dir: FileDir::Game,
+            },
+        ],
+    }
+    .finalize()
+    .unwrap()
+}
+
+fn status_with(config: Option<ConfigStatus>) -> ClientMsg {
+    ClientMsg::Status {
+        in_game: false,
+        rtt_ms: None,
+        loss_pct: None,
+        config,
+    }
+}
+
+fn is_config(m: &ServerMsg, id: Option<&str>) -> bool {
+    matches!(m, ServerMsg::GameConfig { config, .. } if config.as_ref().map(|c| c.id.as_str()) == id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn game_config_is_validated_stored_and_broadcast() {
+    let mut srv = TestServer::start().await;
+    let mut a = srv.login("Frodo").await;
+    let mut b = srv.login("Sam").await;
+    assert_eq!(a.features, [FEATURE_GAME_CONFIG]);
+    // The current configuration (vanilla) follows the login.
+    b.expect("initial configuration", |m| is_config(m, None)).await;
+
+    let config = game_config('a');
+    let set = |c: Option<GameConfig>| ClientMsg::SetGameConfig { config: c.map(Box::new) };
+    b.send(&set(Some(config.clone()))).await;
+    b.expect_error(ErrorCode::NotHost).await;
+    let mut bad = config.clone();
+    bad.files[0].path = "..\\..\\evil.big".into();
+    bad.id = bad.compute_id();
+    a.send(&set(Some(bad))).await;
+    let text = a.expect_error(ErrorCode::BadRequest).await;
+    assert!(text.contains("Ungültige Spielkonfiguration"), "{text}");
+    let mut wrong_id = config.clone();
+    wrong_id.id = "f".repeat(32);
+    a.send(&set(Some(wrong_id))).await;
+    a.expect_error(ErrorCode::BadRequest).await;
+
+    a.send(&set(Some(config.clone()))).await;
+    for c in [&mut a, &mut b] {
+        match c.expect("configuration", |m| is_config(m, Some(&config.id))).await {
+            ServerMsg::GameConfig { config: Some(got), by } => {
+                assert_eq!(*got, config);
+                assert_eq!(by, "Frodo");
+            }
+            _ => unreachable!(),
+        }
+    }
+    b.expect_chat("", "Frodo hat die Spielversion gewählt: Patch 2.22 7.0.5 (EN)").await;
+    // The same configuration again changes nothing; another one right away is
+    // refused (each change is a large message to everybody).
+    a.send(&set(Some(config.clone()))).await;
+    a.send(&set(None)).await;
+    a.expect_error(ErrorCode::RateLimited).await;
+    // A player who joins later gets the current configuration.
+    let mut c = srv.login("Merry").await;
+    c.expect("configuration after login", |m| is_config(m, Some(&config.id))).await;
+    let status = srv.status().await;
+    assert_eq!(status["server"]["game_config"]["name"], "Patch 2.22");
+    assert_eq!(status["server"]["game_config"]["set_by"], "Frodo");
+    assert_eq!(status["server"]["game_config"]["files"], 2);
+    // Back to vanilla after the cool-down.
+    tokio::time::sleep(CONFIG_COOLDOWN + Duration::from_millis(100)).await;
+    a.send(&set(None)).await;
+    c.expect("vanilla", |m| is_config(m, None)).await;
+    c.expect_chat("", "Vanilla").await;
+    assert!(srv.status().await["server"]["game_config"].is_null());
+    srv.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_gates_launch_all_and_resets_on_change() {
+    let mut srv = TestServer::start().await;
+    let mut a = srv.login("Frodo").await;
+    let mut b = srv.login("Sam").await;
+    let x = game_config('a');
+    a.send(&ClientMsg::SetGameConfig {
+        config: Some(Box::new(x.clone())),
+    })
+    .await;
+    a.expect("configuration", |m| is_config(m, Some(&x.id))).await;
+    a.send(&ClientMsg::LaunchAll).await;
+    let text = a.expect_error(ErrorCode::NotReady).await;
+    assert!(
+        text.contains("Patch 2.22 7.0.5") && text.contains("Frodo (") && text.contains("Sam ("),
+        "{text}"
+    );
+
+    b.send(&ClientMsg::Ready { ready: true }).await;
+    a.send(&status_with(Some(ConfigStatus::ready(x.id.clone())))).await;
+    b.send(&status_with(Some(ConfigStatus {
+        id: x.id.clone(),
+        state: ConfigState::Preparing,
+        progress: Some(50),
+        missing: None,
+        text: Some("lädt\nherunter".into()),
+    })))
+    .await;
+    let players = a
+        .expect_lobby("readiness", |p| {
+            p.len() == 2
+                && p[0].config.is_some()
+                && p[1].config.as_ref().is_some_and(|c| c.progress == Some(50))
+        })
+        .await;
+    assert!(players[0].config.as_ref().unwrap().is_ready_for(&x.id));
+    assert_eq!(
+        players[1].config.as_ref().unwrap().text.as_deref(),
+        Some("lädt herunter"),
+        "sanitised"
+    );
+    assert!(players[1].ready);
+    a.send(&ClientMsg::LaunchAll).await;
+    let text = a.expect_error(ErrorCode::NotReady).await;
+    assert!(text.contains("Sam (bereitet vor, 50 %)") && !text.contains("Frodo"), "{text}");
+    // A malformed report counts as no report.
+    b.send(&status_with(Some(ConfigStatus::ready("../x")))).await;
+    a.expect_lobby("report dropped", |p| p.len() == 2 && p[1].config.is_none())
+        .await;
+
+    // A new configuration resets every ready flag and report.
+    tokio::time::sleep(CONFIG_COOLDOWN + Duration::from_millis(100)).await;
+    let y = game_config('b');
+    a.send(&ClientMsg::SetGameConfig {
+        config: Some(Box::new(y.clone())),
+    })
+    .await;
+    b.expect_lobby("reset", |p| {
+        p.len() == 2 && p.iter().all(|x| x.config.is_none() && !x.ready)
+    })
+    .await;
+    b.expect("configuration y", |m| is_config(m, Some(&y.id))).await;
+    // A report for the old configuration does not count.
+    a.send(&status_with(Some(ConfigStatus::ready(y.id.clone())))).await;
+    b.send(&status_with(Some(ConfigStatus::ready(x.id.clone())))).await;
+    a.expect_lobby("reports", |p| p.len() == 2 && p.iter().all(|x| x.config.is_some()))
+        .await;
+    a.send(&ClientMsg::LaunchAll).await;
+    let text = a.expect_error(ErrorCode::NotReady).await;
+    assert!(text.contains("Sam (prüft"), "{text}");
+    b.send(&status_with(Some(ConfigStatus::ready(y.id.clone())))).await;
+    a.expect_lobby("all ready", |p| {
+        p.iter()
+            .all(|x| x.config.as_ref().is_some_and(|c| c.is_ready_for(&y.id)))
+    })
+    .await;
+    a.send(&ClientMsg::LaunchAll).await;
+    a.expect("launch", |m| matches!(m, ServerMsg::Launch)).await;
+    b.expect("launch", |m| matches!(m, ServerMsg::Launch)).await;
+    srv.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_server_starts_with_vanilla() {
+    let mut srv = TestServer::start().await;
+    let mut a = srv.login("Frodo").await;
+    let x = game_config('a');
+    a.send(&ClientMsg::SetGameConfig {
+        config: Some(Box::new(x.clone())),
+    })
+    .await;
+    a.expect("configuration", |m| is_config(m, Some(&x.id))).await;
+    srv.shutdown().await;
+    drop(a);
+    let mut srv = TestServer::start().await;
+    let mut a = srv.login("Frodo").await;
+    a.expect("vanilla after the restart", |m| is_config(m, None)).await;
+    srv.shutdown().await;
 }
