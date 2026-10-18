@@ -114,7 +114,20 @@ pub fn layers(set: &PackageSet, guid: &str, version: Option<&str>) -> Result<Lay
                     set.get(&d.guid, d.version.as_deref())
                         .filter(|p| matches!(p.kind, PackageKind::Patch | PackageKind::Mod))
                 })
-                .ok_or_else(|| ResolveError::NoBase(selected.name.clone()))?;
+                .ok_or_else(|| {
+                    // Name the dependency the library lacks, if that is the reason.
+                    match selected
+                        .dependencies
+                        .iter()
+                        .find(|d| set.get(&d.guid, d.version.as_deref()).is_none())
+                    {
+                        Some(d) => ResolveError::MissingDependency {
+                            dependency: d.to_string(),
+                            of: selected.name.clone(),
+                        },
+                        None => ResolveError::NoBase(selected.name.clone()),
+                    }
+                })?;
             (Some(Arc::clone(&selected)), base)
         }
         other => return Err(ResolveError::Unsupported(other)),
@@ -400,6 +413,7 @@ pub(crate) mod tests {
         add(manifest_json("mod-t1", "Type One", "1.0.0", 1, &[("t1.big", &md5('f'), 3, "ALL")], &[PATCH]));
         add(manifest_json("maps", "Map Pack", "1.0", 3, &[], &[]));
         add(manifest_json("broken", "Broken", "1.0", 0, &[], &["missing-dep:2.0"]));
+        add(manifest_json("enh-orphan", "Orphan", "1.0", 2, &[], &["missing-patch"]));
         set
     }
 
@@ -464,6 +478,10 @@ pub(crate) mod tests {
         assert!(matches!(layers(&set, "nope", None), Err(ResolveError::UnknownPackage(_))));
         assert!(matches!(layers(&set, "maps", None), Err(ResolveError::Unsupported(PackageKind::MapPack))));
         assert!(matches!(layers(&set, "broken", None), Err(ResolveError::MissingDependency { .. })));
+        assert!(matches!(
+            layers(&set, "enh-orphan", None),
+            Err(ResolveError::MissingDependency { ref dependency, .. }) if dependency == "missing-patch"
+        ));
         let l = layers(&set, MOD, None).unwrap();
         assert!(matches!(build_config(&l, "english", &|_| None), Err(ResolveError::BadLanguage(_))));
         let mut no_base = PackageSet::new();
@@ -480,7 +498,10 @@ pub(crate) mod tests {
         set.active = Some((PATCH.into(), "1.0.0".into()));
         let cat = catalog(&set, Some("DE"), &|_| None);
         let names: Vec<&str> = cat.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["Broken", "Classic UI", "Legends of the 3rd Age", "Patch 1.06", "Type One", "Vanilla (1.03)"]);
+        assert_eq!(
+            names,
+            ["Broken", "Classic UI", "Legends of the 3rd Age", "Orphan", "Patch 1.06", "Type One", "Vanilla (1.03)"]
+        );
         let lot3a = cat.iter().find(|e| e.guid == MOD).unwrap();
         assert_eq!(lot3a.with, ["Patch 1.06 1.0.0"]);
         assert_eq!(lot3a.default_language, "DE");
