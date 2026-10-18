@@ -19,8 +19,9 @@ use crate::log::info;
 use crate::pe::{self, Headers, Image, LiveImage, PeError};
 use crate::{ffi, fw, log, multi, reg, state, ws2};
 
-/// Maximum number of patched slots (5 WS2_32 + 2 registry + 4 test mode).
-const MAX_PATCHES: usize = 11;
+/// Maximum number of patched slots (5 WS2_32 + CoCreateInstance + 2 registry +
+/// 4 test mode; the test `patch_table_fits_every_hook` keeps this in sync).
+const MAX_PATCHES: usize = 12;
 
 /// One installed IAT patch.
 #[derive(Clone, Copy)]
@@ -45,10 +46,19 @@ impl PatchList {
         Self { items: [None; MAX_PATCHES] }
     }
 
-    fn push(&mut self, p: Patch) {
-        if let Some(free) = self.items.iter_mut().find(|i| i.is_none()) {
-            *free = Some(p);
+    /// Records `p`; `false` if the table is full.
+    fn push(&mut self, p: Patch) -> bool {
+        match self.items.iter_mut().find(|i| i.is_none()) {
+            Some(free) => {
+                *free = Some(p);
+                true
+            }
+            None => false,
         }
+    }
+
+    fn is_full(&self) -> bool {
+        self.items.iter().all(Option::is_some)
     }
 
     fn iter(&self) -> impl Iterator<Item = &Patch> {
@@ -71,6 +81,8 @@ enum Optional {
     Failed(PatchError),
     /// Import table unreadable.
     Unreadable(PeError),
+    /// Not patched: no room left to track it (it could not be re-verified).
+    NoRoom,
 }
 
 /// Why the mandatory WS2_32 patch set failed.
@@ -281,6 +293,9 @@ fn install_optional(
         Ok(None) => return Optional::NotImported,
         Err(e) => return Optional::Unreadable(e),
     };
+    if list.is_full() {
+        return Optional::NoRoom;
+    }
     let slot = Slot::new(img.base() as usize, img.size(), rva);
     // SAFETY: the slot lies in the main module's IAT; loader lock held.
     match unsafe { slot.patch(hook, orig) } {
@@ -418,6 +433,7 @@ fn optional_text(o: Optional) -> &'static str {
         Optional::Failed(PatchError::NotChainable) => "FAILED (slot not resolved)",
         Optional::Failed(PatchError::Protect) => "FAILED (VirtualProtect)",
         Optional::Unreadable(_) => "FAILED (import table unreadable)",
+        Optional::NoRoom => "FAILED (patch table full)",
     }
 }
 
@@ -492,6 +508,28 @@ fn write_report(r: &Report, rv: Reverify) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the firewall hook made 12 patches in test mode with a 11-entry
+    /// table, and the last one (SHGetSpecialFolderPathW) went unrecorded, so it was
+    /// never re-verified after a re-snap of the IAT.
+    #[test]
+    fn patch_table_fits_every_hook() {
+        let optional = include_str!("init.rs").matches(concat!("install_optional", "(img,")).count();
+        assert_eq!(optional, 7, "update MAX_PATCHES with the optional hooks");
+        assert!(ws2::NAMES.len() + optional <= MAX_PATCHES);
+
+        let slot = Slot::new(0x1000, 0x1000, 0x10);
+        static ORIG: AtomicUsize = AtomicUsize::new(0);
+        let p = Patch { name: "x", slot, hook: 1, orig: &ORIG, probe: None };
+        let mut list = PatchList::new();
+        for _ in 0..MAX_PATCHES {
+            assert!(!list.is_full());
+            assert!(list.push(p));
+        }
+        assert!(list.is_full());
+        assert!(!list.push(p), "a full table says so");
+        assert_eq!(list.iter().count(), MAX_PATCHES);
+    }
 
     #[test]
     fn slot_reverification_decisions() {
