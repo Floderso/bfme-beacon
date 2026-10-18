@@ -74,6 +74,15 @@ impl Drop for TempDir {
 }
 
 async fn start_server(dir: &Path, port: u16, salt: [u8; 16]) -> RunningServer {
+    start_server_with(dir, port, salt, |_| {}).await
+}
+
+async fn start_server_with(
+    dir: &Path,
+    port: u16,
+    salt: [u8; 16],
+    tune: impl Fn(&mut beacon_server::config::Settings),
+) -> RunningServer {
     init_logging();
     let cfg = Config {
         server_name: "Testserver".into(),
@@ -90,6 +99,7 @@ async fn start_server(dir: &Path, port: u16, salt: [u8; 16]) -> RunningServer {
     };
     let mut settings = cfg.into_settings(dir).unwrap();
     settings.lobby_refresh = Duration::from_millis(200);
+    tune(&mut settings);
     // A restarted server may need a moment until the port is free again.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -174,6 +184,10 @@ struct FakeHook {
 impl FakeHook {
     async fn new(app: &App) -> Self {
         let (port, token) = app.agent_endpoint();
+        Self::at(port, token).await
+    }
+
+    async fn at(port: u16, token: u32) -> Self {
         Self {
             sock: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
             agent: SocketAddr::from(([127, 0, 0, 1], port)),
@@ -530,4 +544,328 @@ async fn commands_validate_their_input_and_settings_are_saved() {
     let saved = std::fs::read_to_string(dir.0.join("alice").join("config.json")).unwrap();
     assert!(saved.contains("Gandalf") && saved.contains("1280"));
     app.quit().await;
+}
+
+// ---- reconnects while BFME runs ---------------------------------------------
+
+use beacon_launcher::agent::{AgentHandle, AgentStats};
+use beacon_launcher::config::{ConfigStore, ServerAddr};
+use beacon_launcher::control::{
+    self, ConnectParams, Connected, ControlEvent, ControlHandle, Credentials, Deps, StatusReport,
+};
+use beacon_proto::fingerprint::Fingerprint;
+use tokio::sync::{mpsc, watch};
+
+/// A control supervisor + agent outside an `App`, so that the test can report a
+/// running game (`in_game`), which `App` only does for a real launch.
+struct InGamePlayer {
+    agent: AgentHandle,
+    control: Option<ControlHandle>,
+    events: mpsc::UnboundedReceiver<ControlEvent>,
+    _status: watch::Sender<StatusReport>,
+    _fingerprint: watch::Sender<Option<Arc<Fingerprint>>>,
+}
+
+impl InGamePlayer {
+    async fn connect(dir: &Path, who: &str, server: SocketAddr, name: &str) -> Self {
+        let base = dir.join(who);
+        std::fs::create_dir_all(&base).unwrap();
+        let (config, _) = ConfigStore::load(&base.join("config.json"));
+        let (agent, _task) = AgentHandle::start(AgentOptions {
+            tick: Duration::from_millis(100),
+            ..AgentOptions::default()
+        })
+        .await
+        .unwrap();
+        let status = watch::channel(StatusReport {
+            in_game: true,
+            ..StatusReport::default()
+        })
+        .0;
+        let fingerprint = watch::channel(None).0;
+        let (events_tx, mut events_rx) = mpsc::channel::<(u64, ControlEvent)>(64);
+        let (tx, events) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some((_, ev)) = events_rx.recv().await {
+                if !matches!(ev, ControlEvent::Message(_)) && tx.send(ev).is_err() {
+                    return;
+                }
+            }
+        });
+        let deps = Deps {
+            config: Arc::new(config),
+            agent: agent.clone(),
+            events: events_tx,
+            generation: 1,
+            status: status.subscribe(),
+            fingerprint: fingerprint.subscribe(),
+        };
+        let control = control::spawn(
+            ConnectParams {
+                addr: ServerAddr::parse(&server.to_string()).unwrap(),
+                name: name.to_owned(),
+                credentials: Credentials::Password(PASSWORD.to_owned()),
+                remember: false,
+            },
+            deps,
+        );
+        Self {
+            agent,
+            control: Some(control),
+            events,
+            _status: status,
+            _fingerprint: fingerprint,
+        }
+    }
+
+    /// The next login; panics on a permanent failure.
+    async fn connected(&mut self, within: Duration) -> Connected {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            match tokio::time::timeout_at(deadline, self.events.recv()).await {
+                Ok(Some(ControlEvent::Connected(c))) => return c,
+                Ok(Some(ControlEvent::Disconnected { error, retry_in: None })) => {
+                    panic!("the supervisor gave up: {error:?}")
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => panic!("no login within {within:?}"),
+            }
+        }
+    }
+
+    /// Logs in again; returns the login and the retry delays announced before it.
+    async fn reconnected(&mut self, within: Duration) -> (Connected, Vec<Duration>) {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut delays = Vec::new();
+        loop {
+            match tokio::time::timeout_at(deadline, self.events.recv()).await {
+                Ok(Some(ControlEvent::Connected(c))) => return (c, delays),
+                Ok(Some(ControlEvent::Disconnected { retry_in: Some(d), .. })) => delays.push(d),
+                Ok(Some(ControlEvent::Disconnected { error, retry_in: None })) => {
+                    panic!("the supervisor gave up: {error:?}")
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => panic!("no login within {within:?}"),
+            }
+        }
+    }
+
+    /// `true` if a login happened since the last look (events are consumed).
+    fn logged_in_meanwhile(&mut self) -> bool {
+        let mut seen = false;
+        while let Ok(ev) = self.events.try_recv() {
+            seen |= matches!(ev, ControlEvent::Connected(_));
+        }
+        seen
+    }
+
+    /// The next connection loss (with a retry scheduled).
+    async fn lost(&mut self) -> ControlError {
+        loop {
+            match timeout(T, self.events.recv()).await {
+                Ok(Some(ControlEvent::Disconnected { error: Some(e), retry_in: Some(_) })) => return e,
+                Ok(Some(ControlEvent::Disconnected { error, retry_in: None })) => {
+                    panic!("the supervisor gave up: {error:?}")
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => panic!("no disconnect"),
+            }
+        }
+    }
+
+    async fn hook(&self) -> FakeHook {
+        FakeHook::at(self.agent.port(), self.agent.token()).await
+    }
+
+    async fn acked(&self, vport: u16) {
+        let mut rx = self.agent.watch_stats();
+        let deadline = tokio::time::Instant::now() + T;
+        let done = |s: &AgentStats| s.registrations.iter().any(|r| r.vport == vport && r.acked);
+        while !done(&rx.borrow_and_update()) {
+            if tokio::time::timeout_at(deadline, rx.changed()).await.is_err() {
+                panic!("no REG_ACK for {vport}: {:#?}", self.agent.stats());
+            }
+        }
+    }
+
+    async fn stop(mut self) {
+        if let Some(c) = self.control.take() {
+            c.disconnect().await;
+        }
+        self.agent.shutdown().await;
+    }
+}
+
+/// Sends `payload` from `from` to `to` until it arrives (the receiving side may
+/// still be re-registering) within `within` and checks its source.
+async fn flows(
+    from: &FakeHook,
+    to: &FakeHook,
+    (src_vip, dst_vip): (Ipv4Addr, Ipv4Addr),
+    payload: &[u8],
+    within: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        from.send(8094, dst_vip, 8094, payload).await;
+        if let Some(got) = to.deliver(Duration::from_millis(300)).await {
+            assert_eq!(got, (src_vip, 8094, payload.to_vec()));
+            // Drain stragglers of earlier attempts.
+            while to.deliver(Duration::from_millis(50)).await.is_some() {}
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{payload:?} did not arrive within {within:?}");
+    }
+}
+
+/// Regression: a server restart (update, `docker restart`) kicked every player
+/// with "Der Server wird beendet." and the launcher took that `kick` for a
+/// removal: no reconnect, relay closed, the running match lost all its players.
+/// Also: while BFME runs, the reconnect delay must stay short (BFME drops a
+/// silent player after 8 s + 20 s), the vIP must survive the restart and the
+/// relay ports must be registered again at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_restart_mid_game_reconnects_quickly_with_the_same_vip() {
+    let dir = TempDir::new("restart");
+    let server = start_server(&dir.0, 0, SALT_A).await;
+    let addr = server.control_addr();
+    let mut alice = InGamePlayer::connect(&dir.0, "alice", addr, "Alice").await;
+    let mut bob = InGamePlayer::connect(&dir.0, "bob", addr, "Bob").await;
+    let (vip_a, vip_b) = (alice.connected(T).await.vip, bob.connected(T).await.vip);
+    let alice_port = alice.agent.port();
+    let (hook_a, hook_b) = (alice.hook().await, bob.hook().await);
+    hook_a.reg(8094).await;
+    hook_b.reg(8094).await;
+    alice.acked(8094).await;
+    bob.acked(8094).await;
+    flows(&hook_a, &hook_b, (vip_a, vip_b), b"before", T).await;
+
+    server.shutdown().await;
+    for p in [&mut alice, &mut bob] {
+        let e = p.lost().await;
+        assert!(matches!(e, ControlError::ServerStopped { .. }), "{e:?}");
+    }
+    // A restart that takes a while: the exponential backoff (1, 1, 2, 4, 8 s; on
+    // Windows a refused connect itself takes about 2 s) would be at 4 s by now.
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let server = start_server(&dir.0, addr.port(), SALT_A).await;
+    for p in [&mut alice, &mut bob] {
+        let (c, delays) = p.reconnected(T).await;
+        assert!(delays.len() >= 2, "{delays:?}");
+        let max = control::BACKOFF_MAX_IN_GAME + control::BACKOFF_MAX_IN_GAME / 4;
+        assert!(delays.iter().all(|d| *d <= max), "in-game retry delays {delays:?}");
+        assert_eq!(c.vip, if p.agent.port() == alice_port { vip_a } else { vip_b }, "vIPs survive the restart");
+    }
+    flows(&hook_a, &hook_b, (vip_a, vip_b), b"after", T).await;
+    flows(&hook_b, &hook_a, (vip_b, vip_a), b"and back", T).await;
+    alice.stop().await;
+    bob.stop().await;
+    server.shutdown().await;
+}
+
+/// A TCP forwarder for one player's control connection. `cut` closes the
+/// player's side of the current connections but keeps the server's side open
+/// and silent: what the server sees when the player's public IP changes
+/// (DSL reconnect) - it holds the player until its idle timeout.
+struct CutProxy {
+    addr: SocketAddr,
+    cut: watch::Sender<u32>,
+}
+
+impl CutProxy {
+    async fn start(server: SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (cut, _) = watch::channel(0u32);
+        let cut_tx = cut.clone();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(upstream) = tokio::net::TcpStream::connect(server).await else {
+                    continue;
+                };
+                let mut cut_rx = cut_tx.subscribe();
+                cut_rx.borrow_and_update();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let (mut cr, mut cw) = client.into_split();
+                    let (mut ur, mut uw) = upstream.into_split();
+                    let (mut a, mut b) = ([0u8; 4096], [0u8; 4096]);
+                    loop {
+                        tokio::select! {
+                            r = cr.read(&mut a) => match r {
+                                Ok(n) if n > 0 => {
+                                    if uw.write_all(&a[..n]).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                _ => return,
+                            },
+                            r = ur.read(&mut b) => match r {
+                                Ok(n) if n > 0 => {
+                                    if cw.write_all(&b[..n]).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                _ => return,
+                            },
+                            _ = cut_rx.changed() => {
+                                drop((cr, cw));
+                                // Keep the server's side open; swallow what it sends.
+                                let _keep = uw;
+                                while matches!(ur.read(&mut b).await, Ok(n) if n > 0) {}
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Self { addr, cut }
+    }
+
+    fn cut(&self) {
+        self.cut.send_modify(|n| *n += 1);
+    }
+}
+
+/// Regression: when the control connection broke while the server still held the
+/// player, the launcher closed the relay at once. The game then lost its peers
+/// until the server's idle timeout released the name (reconnects are refused with
+/// `name_taken` until then) - BFME drops a player after 28 s. The relay session
+/// must stay usable until the server ends it, and the reconnect must follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broken_control_connection_keeps_the_relay_until_the_server_lets_go() {
+    let dir = TempDir::new("halfopen");
+    let server = start_server_with(&dir.0, 0, SALT_A, |s| s.idle_timeout = Duration::from_secs(15)).await;
+    let proxy = CutProxy::start(server.control_addr()).await;
+    let mut alice = InGamePlayer::connect(&dir.0, "alice", proxy.addr, "Alice").await;
+    let mut bob = InGamePlayer::connect(&dir.0, "bob", server.control_addr(), "Bob").await;
+    let (vip_a, vip_b) = (alice.connected(T).await.vip, bob.connected(T).await.vip);
+    let (hook_a, hook_b) = (alice.hook().await, bob.hook().await);
+    hook_a.reg(8094).await;
+    hook_b.reg(8094).await;
+    alice.acked(8094).await;
+    bob.acked(8094).await;
+    flows(&hook_b, &hook_a, (vip_b, vip_a), b"before", T).await;
+
+    // Alice's control connection breaks; the server does not notice (yet: it last
+    // heard from her at most 5 s ago and holds her for 15 s).
+    proxy.cut();
+    let e = alice.lost().await;
+    assert!(matches!(e, ControlError::Closed { .. }), "{e:?}");
+    // The game keeps talking through the relay in both directions.
+    let quick = Duration::from_secs(2);
+    flows(&hook_b, &hook_a, (vip_b, vip_a), b"during", quick).await;
+    flows(&hook_a, &hook_b, (vip_a, vip_b), b"during, back", quick).await;
+    assert!(alice.agent.stats().session_active);
+    assert!(!alice.logged_in_meanwhile(), "that went through the old relay session");
+
+    // Once the server drops the silent connection, Alice gets back in with the
+    // same vIP (after `name_taken` refusals) and her ports are registered again.
+    let (a, _) = alice.reconnected(Duration::from_secs(30)).await;
+    assert_eq!(a.vip, vip_a);
+    flows(&hook_b, &hook_a, (vip_b, vip_a), b"after", T).await;
+    alice.stop().await;
+    bob.stop().await;
+    server.shutdown().await;
 }

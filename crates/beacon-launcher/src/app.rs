@@ -450,6 +450,8 @@ impl App {
         inner.new_generation(ConnectionState::Disconnected);
         if let Some(h) = control.take() {
             h.disconnect().await;
+            // The supervisor ends the relay session itself unless it had to be aborted.
+            inner.agent.set_session(None).await;
             info!("disconnected");
         }
     }

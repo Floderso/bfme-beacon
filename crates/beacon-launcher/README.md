@@ -83,11 +83,19 @@ initiator, `hello{name, version, fingerprint}`, `welcome` → relay session for 
 agent. Session: `fingerprint_files` (whenever the fingerprint is known/changes),
 `status{in_game, rtt_ms, loss_pct}` (in_game changes at once, measurements at most
 every 5 s), `map_list`, ping every 5 s, idle timeout 30 s. Reconnect with
-exponential backoff 1 s … 30 s (+ jitter) while connected is wanted; permanent
-errors (wrong password = `AuthFailed`, `IdentityChanged`, `BadName`,
-`UnsupportedVersion`, kick, not a Beacon server) stop it. The password is wiped after
-the first derivation (the key is cached for reconnects); "remember" stores only the
-32-byte PSK, DPAPI-encrypted for the current user.
+exponential backoff 1 s … 30 s (+ jitter) while connected is wanted – at most 2 s
+(+ jitter) while BFME runs (the game drops a silent player after 8 s + 20 s);
+permanent errors (wrong password = `AuthFailed`, `IdentityChanged`, `BadName`,
+`UnsupportedVersion`, kick, not a Beacon server) stop it. Exceptions: the `kick`
+a stopping server sends to everybody ("Der Server wird beendet.") is
+`ServerStopped` and reconnects; `AuthFailed` after the key already worked in this
+connection is retried twice (a reset during the handshake looks the same). The
+agent's relay session outlives a broken control connection until a new login
+replaces it, the server ends it (relay `BYE`) or the user disconnects: while the
+server still holds the player (half-open TCP after a new public IP; reconnects get
+`name_taken`) the relay, which follows NAT rebinding, keeps the game going. The
+password is wiped after the first derivation (the key is cached for reconnects);
+"remember" stores only the 32-byte PSK, DPAPI-encrypted for the current user.
 
 **Agent** (`agent`): UDP `127.0.0.1:0` for the hook (random u32 local token) and one
 UDP socket per relay session. Hook `REG` → relay `REG` (repeated every 1 s until

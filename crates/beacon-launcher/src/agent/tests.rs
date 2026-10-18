@@ -363,3 +363,41 @@ async fn ping_pong_measures_rtt_and_session_changes_reregister() {
     wait_stats(&agent, "inactive", |s| !s.session_active).await;
     task.abort();
 }
+
+/// Regression: the relay socket is fresh when a session starts, and tokio's
+/// `try_send_to` reports `WouldBlock` until the reactor has seen it writable. The
+/// REGs of ports the game already holds (a reconnect mid-game) and the first PING
+/// must still go out at once, not one housekeeping tick later.
+#[tokio::test]
+async fn session_start_sends_reg_and_ping_at_once() {
+    let slow = AgentOptions {
+        tick: Duration::from_secs(30),
+        ..AgentOptions::default()
+    };
+    let (agent, task) = AgentHandle::start(slow).await.unwrap();
+    let hook = FakeHook::new(&agent).await;
+    hook.reg(8086).await;
+    hook.reg(8094).await;
+    // (`learn` does not publish stats; give the agent a moment to read both.)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for round in 0..3 {
+        let mut relay = FakeRelay::new().await;
+        agent.set_session(Some(relay.session())).await;
+        let mut seen = Vec::new();
+        while seen.len() < 3 {
+            let (_, h, _) = relay
+                .recv(Duration::from_millis(500))
+                .await
+                .unwrap_or_else(|| panic!("round {round}: only {seen:?} at session start"));
+            seen.push((h.kind, h.src_vport));
+        }
+        seen.sort_by_key(|&(k, p)| (k as u8, p));
+        assert_eq!(
+            seen,
+            [(PacketType::Reg, 8086), (PacketType::Reg, 8094), (PacketType::Ping, 0)],
+            "round {round}"
+        );
+    }
+    assert_eq!(agent.stats().dropped_send, 0);
+    task.abort();
+}

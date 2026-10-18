@@ -35,8 +35,22 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 /// Longest reconnect delay.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Longest reconnect delay while BFME runs: the game raises its disconnect screen
+/// after 8 s without a packet from a peer and drops the peer about 20 s later
+/// (spec 02 §6), so a restarted server must be found again within seconds.
+pub const BACKOFF_MAX_IN_GAME: Duration = Duration::from_secs(2);
 /// Status reports with unchanged `in_game` are sent at most this often.
 pub const STATUS_INTERVAL: Duration = Duration::from_secs(5);
+/// `AuthFailed` after the key already worked in this connection is retried this
+/// often before it counts as a wrong password: the server answers a wrong key by
+/// closing the connection, which a connection reset during the handshake of a
+/// reconnect looks exactly like. (Each failure counts towards the server's ban of
+/// the IP after 5, which players behind the same NAT share.)
+pub const AUTH_RETRIES_AFTER_LOGIN: u32 = 2;
+/// The `kick` reason beacon-server sends to every player when it stops (restart,
+/// update; `beacon-server/src/control.rs`). That is no removal: the supervisor
+/// reconnects once the server is back (`tests/app.rs` keeps the text in sync).
+pub const SERVER_STOPPING_REASON: &str = "Der Server wird beendet.";
 
 /// How the user authenticates.
 pub enum Credentials {
@@ -151,6 +165,11 @@ pub enum ControlError {
         /// Reason.
         reason: String,
     },
+    /// The server is stopping (restart, update): reconnect.
+    ServerStopped {
+        /// Text from the server.
+        reason: String,
+    },
     /// Malformed data from the server.
     Protocol {
         /// Reason.
@@ -182,6 +201,15 @@ impl ControlError {
                 ErrorCode::NameTaken | ErrorCode::ServerFull | ErrorCode::RateLimited | ErrorCode::Internal
             ),
             _ => false,
+        }
+    }
+
+    /// The error for a `kick` with `reason`: a stopping server is not a removal.
+    pub fn kicked(reason: String) -> Self {
+        if reason == SERVER_STOPPING_REASON {
+            Self::ServerStopped { reason }
+        } else {
+            Self::Kicked { reason }
         }
     }
 
@@ -220,6 +248,7 @@ impl fmt::Display for ControlError {
             Self::AuthFailed => f.write_str("login failed: wrong password (or this IP is temporarily blocked)"),
             Self::Rejected { code, text } => write!(f, "refused by the server ({code:?}): {text}"),
             Self::Kicked { reason } => write!(f, "removed from the server: {reason}"),
+            Self::ServerStopped { reason } => write!(f, "the server is stopping ({reason})"),
             Self::Protocol { message } => write!(f, "protocol error: {message}"),
             Self::Io { message } => write!(f, "connection error: {message}"),
             Self::IdleTimeout => f.write_str("the server stopped answering"),
@@ -345,10 +374,43 @@ impl ControlHandle {
 /// Reconnect delay for attempt `n` (1-based): 1 s, 2 s, 4 s … 30 s, + up to 25 %
 /// jitter.
 pub fn backoff(attempt: u32, jitter: u32) -> Duration {
+    backoff_capped(attempt, jitter, BACKOFF_MAX)
+}
+
+/// Reconnect delay while BFME runs: 1 s, then [`BACKOFF_MAX_IN_GAME`], + jitter.
+pub fn backoff_in_game(attempt: u32, jitter: u32) -> Duration {
+    backoff_capped(attempt, jitter, BACKOFF_MAX_IN_GAME)
+}
+
+fn backoff_capped(attempt: u32, jitter: u32, max: Duration) -> Duration {
     let exp = attempt.saturating_sub(1).min(5);
-    let base = BACKOFF_MIN.saturating_mul(1 << exp).min(BACKOFF_MAX);
+    let base = BACKOFF_MIN.saturating_mul(1 << exp).min(max);
     let extra = base / 4 * (jitter % 1000) / 1000;
-    (base + extra).min(BACKOFF_MAX + BACKOFF_MAX / 4)
+    (base + extra).min(max + max / 4)
+}
+
+/// Decides which failed attempts end the supervisor.
+#[derive(Debug, Default)]
+pub struct RetryPolicy {
+    logged_in: bool,
+    auth_failures: u32,
+}
+
+impl RetryPolicy {
+    /// A login succeeded (the key is right).
+    pub fn logged_in(&mut self) {
+        self.logged_in = true;
+        self.auth_failures = 0;
+    }
+
+    /// `true` if `error` ends the reconnect loop.
+    pub fn gives_up(&mut self, error: &ControlError) -> bool {
+        if matches!(error, ControlError::AuthFailed) && self.logged_in {
+            self.auth_failures = self.auth_failures.saturating_add(1);
+            return self.auth_failures > AUTH_RETRIES_AFTER_LOGIN;
+        }
+        error.is_permanent()
+    }
 }
 
 /// Starts the supervisor for `params`.
@@ -381,36 +443,46 @@ async fn wait_for_disconnect(rx: &mut mpsc::Receiver<ControlCmd>) {
     }
 }
 
-async fn supervise(mut params: ConnectParams, deps: Deps, mut rx: mpsc::Receiver<ControlCmd>) {
+/// The supervisor. The agent's relay session outlives a failed control connection
+/// until the next login replaces it, the server ends it (relay `BYE`) or the
+/// supervisor stops: a control connection can break while the server still holds
+/// the player (half-open TCP after a new public IP, a reset by a middlebox), and
+/// then the relay, which follows NAT rebinding, keeps the running game going while
+/// the reconnect waits for the server to release the name (`name_taken`).
+async fn supervise(params: ConnectParams, deps: Deps, mut rx: mpsc::Receiver<ControlCmd>) {
+    supervise_loop(params, &deps, &mut rx).await;
+    deps.agent.set_session(None).await;
+}
+
+async fn supervise_loop(mut params: ConnectParams, deps: &Deps, rx: &mut mpsc::Receiver<ControlCmd>) {
     let mut psk_cache = None;
     let mut attempt: u32 = 0;
+    let mut policy = RetryPolicy::default();
     loop {
         attempt = attempt.saturating_add(1);
-        if !emit(&deps, ControlEvent::Connecting { attempt }).await {
+        if !emit(deps, ControlEvent::Connecting { attempt }).await {
             return;
         }
         let result = tokio::select! {
-            r = session::connect_once(&mut params, &deps, &mut psk_cache) => r,
-            () = wait_for_disconnect(&mut rx) => {
-                emit(&deps, ControlEvent::Disconnected { error: None, retry_in: None }).await;
+            r = session::connect_once(&mut params, deps, &mut psk_cache) => r,
+            () = wait_for_disconnect(rx) => {
+                emit(deps, ControlEvent::Disconnected { error: None, retry_in: None }).await;
                 return;
             }
         };
         let error = match result {
             Ok(est) => {
                 attempt = 0;
+                policy.logged_in();
                 let session = est.relay_session();
                 info!(server = %params.addr, vip = %est.welcome.vip, "logged in");
                 deps.agent.set_session(Some(session)).await;
-                if !emit(&deps, ControlEvent::Connected(est.connected(&params.addr))).await {
-                    deps.agent.set_session(None).await;
+                if !emit(deps, ControlEvent::Connected(est.connected(&params.addr))).await {
                     return;
                 }
-                let end = session::run(est, &mut rx, &deps).await;
-                deps.agent.set_session(None).await;
-                match end {
+                match session::run(est, rx, deps).await {
                     Ok(()) => {
-                        emit(&deps, ControlEvent::Disconnected { error: None, retry_in: None }).await;
+                        emit(deps, ControlEvent::Disconnected { error: None, retry_in: None }).await;
                         return;
                     }
                     Err(e) => e,
@@ -418,15 +490,19 @@ async fn supervise(mut params: ConnectParams, deps: Deps, mut rx: mpsc::Receiver
             }
             Err(e) => e,
         };
-        if error.is_permanent() {
+        if policy.gives_up(&error) {
             warn!(server = %params.addr, "{error}");
-            emit(&deps, ControlEvent::Disconnected { error: Some(error), retry_in: None }).await;
+            emit(deps, ControlEvent::Disconnected { error: Some(error), retry_in: None }).await;
             return;
         }
-        let delay = backoff(attempt, util::random_u32());
+        let delay = if deps.status.borrow().in_game {
+            backoff_in_game(attempt, util::random_u32())
+        } else {
+            backoff(attempt, util::random_u32())
+        };
         warn!(server = %params.addr, "{error}; retrying in {:.1} s", delay.as_secs_f32());
         if !emit(
-            &deps,
+            deps,
             ControlEvent::Disconnected {
                 error: Some(error),
                 retry_in: Some(delay),
@@ -438,8 +514,8 @@ async fn supervise(mut params: ConnectParams, deps: Deps, mut rx: mpsc::Receiver
         }
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
-            () = wait_for_disconnect(&mut rx) => {
-                emit(&deps, ControlEvent::Disconnected { error: None, retry_in: None }).await;
+            () = wait_for_disconnect(rx) => {
+                emit(deps, ControlEvent::Disconnected { error: None, retry_in: None }).await;
                 return;
             }
         }
@@ -459,9 +535,36 @@ mod tests {
     }
 
     #[test]
+    fn in_game_backoff_stays_short() {
+        let ms = |a| backoff_in_game(a, 0).as_millis();
+        assert_eq!([ms(1), ms(2), ms(3), ms(50)], [1000, 2000, 2000, 2000]);
+        assert!(backoff_in_game(u32::MAX, 999) <= BACKOFF_MAX_IN_GAME + BACKOFF_MAX_IN_GAME / 4);
+    }
+
+    #[test]
+    fn auth_failure_after_a_login_is_retried_a_little() {
+        let mut p = RetryPolicy::default();
+        assert!(p.gives_up(&ControlError::AuthFailed), "never logged in: wrong password");
+        let mut p = RetryPolicy::default();
+        p.logged_in();
+        for _ in 0..AUTH_RETRIES_AFTER_LOGIN {
+            assert!(!p.gives_up(&ControlError::AuthFailed));
+            assert!(!p.gives_up(&ControlError::Closed { stage: "hello".into() }));
+        }
+        assert!(p.gives_up(&ControlError::AuthFailed), "the key really is wrong now");
+        p.logged_in();
+        assert!(!p.gives_up(&ControlError::AuthFailed), "a new login resets the count");
+        assert!(p.gives_up(&ControlError::Kicked { reason: String::new() }));
+        assert!(!p.gives_up(&ControlError::Rejected { code: ErrorCode::NameTaken, text: String::new() }));
+    }
+
+    #[test]
     fn permanent_errors() {
         assert!(ControlError::AuthFailed.is_permanent());
         assert!(ControlError::Kicked { reason: String::new() }.is_permanent());
+        // A server restart kicks everybody with a fixed text: reconnect, do not give up.
+        assert!(!ControlError::kicked(SERVER_STOPPING_REASON.into()).is_permanent());
+        assert!(ControlError::kicked("Du wurdest von Host entfernt.".into()).is_permanent());
         assert!(ControlError::Rejected { code: ErrorCode::BadName, text: String::new() }.is_permanent());
         assert!(!ControlError::Rejected { code: ErrorCode::NameTaken, text: String::new() }.is_permanent());
         assert!(!ControlError::IdleTimeout.is_permanent());

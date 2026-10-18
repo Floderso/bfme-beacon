@@ -47,7 +47,16 @@ pub struct LossWindow {
 }
 
 impl LossWindow {
-    /// A ping with timestamp `ts` (ms, strictly increasing) was sent.
+    /// The timestamp for a ping sent at `now` (ms): `now`, or one more than the
+    /// newest recorded ping. Pongs are matched by timestamp, so two pings in one
+    /// millisecond would make the second pong look like a duplicate (a false loss).
+    pub fn stamp(&self, now: u64) -> u64 {
+        self.pings
+            .back()
+            .map_or(now, |&(last, _)| now.max(last.saturating_add(1)))
+    }
+
+    /// A ping with timestamp `ts` (ms, strictly increasing: see [`stamp`](Self::stamp)) was sent.
     pub fn sent(&mut self, ts: u64) {
         if self.pings.len() >= LOSS_WINDOW {
             self.pings.pop_front();
@@ -105,6 +114,20 @@ mod tests {
         assert_eq!(r.rtt_ms(), Some(10));
         r.reset();
         assert_eq!(r.rtt_ms(), None);
+    }
+
+    #[test]
+    fn pings_in_one_millisecond_get_distinct_stamps() {
+        let mut w = LossWindow::default();
+        let a = w.stamp(40);
+        w.sent(a);
+        let b = w.stamp(40);
+        w.sent(b);
+        assert_eq!((a, b), (40, 41));
+        assert_eq!(w.answered(a, 45), Some(5));
+        assert_eq!(w.answered(b, 45), Some(4), "the second pong is not a duplicate");
+        assert_eq!(w.stamp(100), 100);
+        assert_eq!(w.loss_pct(10_000), Some(0));
     }
 
     #[test]

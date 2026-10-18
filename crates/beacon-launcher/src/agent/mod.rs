@@ -50,6 +50,8 @@ const MAX_PENDING_COPIES: usize = 512;
 const BUF_LEN: usize = 2048;
 /// After this many consecutive socket errors the loop pauses briefly.
 const ERROR_BURST: u32 = 64;
+/// Longest wait for a fresh relay socket to become writable.
+const SOCKET_READY_WAIT: Duration = Duration::from_millis(250);
 
 /// Credentials of the current relay session (from `welcome`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,7 +643,8 @@ impl Agent {
     }
 
     fn ping(&mut self) {
-        let ts = self.now_ms();
+        // The PING of a session start can fall into the same millisecond as a tick's.
+        let ts = self.loss.stamp(self.now_ms());
         if self.send_control_with(PacketType::Ping, 0, &encode_timestamp(ts)) {
             self.loss.sent(ts);
             self.stats.pings += 1;
@@ -679,6 +682,13 @@ impl Agent {
             };
             match UdpSocket::bind(bind).await {
                 Ok(sock) => {
+                    // tokio only attempts `try_send_to` once its reactor has seen the
+                    // socket writable; on a fresh socket it reports `WouldBlock`
+                    // without trying, which lost the REGs below (re-registering the
+                    // game's ports after a reconnect) until the next tick.
+                    if tokio::time::timeout(SOCKET_READY_WAIT, sock.writable()).await.is_err() {
+                        warn!("the relay socket is not writable yet");
+                    }
                     info!(relay = %session.relay_addr, vip = %session.vip, "relay session active");
                     self.relay = Some(Relay {
                         sock,

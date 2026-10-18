@@ -416,7 +416,7 @@ pub async fn connect_once(
             you_are_host,
         },
         ServerMsg::Error { code, text } => return Err(ControlError::Rejected { code, text }),
-        ServerMsg::Kick { reason } => return Err(ControlError::Kicked { reason }),
+        ServerMsg::Kick { reason } => return Err(ControlError::kicked(reason)),
         _ => {
             return Err(ControlError::Protocol {
                 message: "expected welcome".into(),
@@ -554,7 +554,7 @@ pub async fn run(est: Established, rx: &mut mpsc::Receiver<ControlCmd>, deps: &D
             last_rx = Instant::now();
             match msg {
                 ServerMsg::Pong { .. } => {}
-                ServerMsg::Kick { reason } => return Err(ControlError::Kicked { reason }),
+                ServerMsg::Kick { reason } => return Err(ControlError::kicked(reason)),
                 other => {
                     if !deps.emit(ControlEvent::Message(other)).await {
                         return Ok(());

@@ -279,6 +279,8 @@
         return REJECTED[e.code] || 'Der Server hat die Anmeldung abgelehnt.';
       case 'kicked':
         return 'Du wurdest vom Server entfernt.';
+      case 'server_stopped':
+        return 'Der Server wurde beendet (Neustart oder Update). Beacon verbindet sich neu, sobald er wieder läuft.';
       case 'protocol':
         return 'Protokollfehler: Der Server sendet unerwartete Daten.';
       case 'io':
