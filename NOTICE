@@ -1,0 +1,43 @@
+BFME Beacon
+Copyright (C) 2026 BFME Beacon contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the file LICENSE for the full text of the GNU General
+Public License, version 3.
+
+
+Credits
+-------
+
+Open-BFME (https://github.com/Open-BFME/Open-BFME-1, GPL-3.0)
+  The reverse engineering behind Beacon builds on Open-BFME's reconstruction of
+  the BFME1 engine (game behaviour, addresses, network protocol). The patch
+  bundle in patches/openbfme-bundle.json is derived from Open-BFME's mod build
+  and contains its GPL-3.0 code cave; see patches/README.md for the origin and
+  the corresponding source.
+
+Rust crates
+  Beacon is built from many open-source Rust crates (listed in Cargo.lock).
+  Each crate keeps its own license (mostly MIT and/or Apache-2.0).
+
+
+Trademarks
+----------
+
+"The Battle for Middle-earth" ("Die Schlacht um Mittelerde") is a trademark of
+its respective owners. BFME Beacon is an unofficial fan project. It is not
+affiliated with, endorsed or sponsored by Electronic Arts or any rights holder
+of the game or of "The Lord of the Rings".
+
+
+No game files
+-------------
+
+This repository and the release packages contain no files of the game: no
+.big archives, executables, maps, string tables or INI files. Every player
+needs their own installation of the game. Beacon never modifies the game's
+executable on disk.
