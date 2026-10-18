@@ -118,15 +118,23 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Serialises index writes of all `Store` values in this process (the app opens
+/// the store from several threads: preparation, catalog, storage overview).
+static INDEX_WRITE: Mutex<()> = Mutex::new(());
+
+fn load_index(dir: &Path) -> Index {
+    util::read_bounded(&dir.join(INDEX_FILE), MAX_INDEX_BYTES)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Index>(&b).ok())
+        .filter(|i| i.version == INDEX_VERSION)
+        .unwrap_or_default()
+}
+
 impl Store {
     /// Opens (and creates) the store folder.
     pub fn open(dir: &Path) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
-        let index = util::read_bounded(&dir.join(INDEX_FILE), MAX_INDEX_BYTES)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Index>(&b).ok())
-            .filter(|i| i.version == INDEX_VERSION)
-            .unwrap_or_default();
+        let index = load_index(dir);
         Ok(Self {
             dir: dir.to_path_buf(),
             index: Mutex::new(index),
@@ -156,16 +164,26 @@ impl Store {
         }
     }
 
+    /// Read-modify-write of the index file (other `Store` values may have added
+    /// entries meanwhile); the in-memory copy becomes the result.
+    fn modify_index(&self, f: impl FnOnce(&mut Index) -> bool) {
+        let _write = lock(&INDEX_WRITE);
+        let mut index = load_index(&self.dir);
+        if f(&mut index) {
+            self.save_index(&index);
+        }
+        *lock(&self.index) = index;
+    }
+
     fn record(&self, md5: &str, d: &Digests) {
-        let mut index = lock(&self.index);
-        index.entries.insert(
-            md5.to_owned(),
-            IndexEntry {
-                size: d.size,
-                blake3: d.blake3.clone(),
-            },
-        );
-        self.save_index(&index);
+        let entry = IndexEntry {
+            size: d.size,
+            blake3: d.blake3.clone(),
+        };
+        self.modify_index(|index| {
+            index.entries.insert(md5.to_owned(), entry);
+            true
+        });
     }
 
     /// The stored file with this MD5, if present and intact (size as recorded).
@@ -176,7 +194,13 @@ impl Store {
         }
         let path = self.path_of(md5);
         let meta = fs::metadata(&path).ok().filter(fs::Metadata::is_file);
-        let entry = lock(&self.index).entries.get(md5).cloned();
+        let mut entry = lock(&self.index).entries.get(md5).cloned();
+        if entry.is_none() && meta.is_some() {
+            // Maybe stored by another `Store` value: read the index again first.
+            let fresh = load_index(&self.dir);
+            entry = fresh.entries.get(md5).cloned();
+            *lock(&self.index) = fresh;
+        }
         match (meta, entry) {
             (Some(meta), Some(e)) if meta.len() == e.size => Some(StoredFile {
                 path,
@@ -219,10 +243,7 @@ impl Store {
     }
 
     fn forget(&self, md5: &str) {
-        let mut index = lock(&self.index);
-        if index.entries.remove(md5).is_some() {
-            self.save_index(&index);
-        }
+        self.modify_index(|index| index.entries.remove(md5).is_some());
     }
 
     /// Copies `src` into the store, verifying MD5 (and the size, if known while
@@ -418,6 +439,24 @@ mod tests {
         assert_eq!(empty.size, 0);
         store.remove(EMPTY_MD5).unwrap();
         assert!(store.get(EMPTY_MD5).is_none());
+        let _ = fsx::remove_tree(&d);
+    }
+
+    #[test]
+    fn two_store_values_share_the_index() {
+        let d = temp("shared");
+        let a = Store::open(&d).unwrap();
+        let b = Store::open(&d).unwrap();
+        let cancel = AtomicBool::new(false);
+        let (src1, src2) = (d.join("one.src"), d.join("two.src"));
+        write_new(&src1, b"one").unwrap();
+        write_new(&src2, b"two").unwrap();
+        a.import_file(&src1, &md5_hex(b"one"), 3, &cancel, &mut |_| {}).unwrap();
+        b.import_file(&src2, &md5_hex(b"two"), 3, &cancel, &mut |_| {}).unwrap();
+        // b's write kept a's entry; a finds b's entry without hashing again.
+        assert_eq!(Store::open(&d).unwrap().usage(), (2, 6));
+        assert_eq!(a.get(&md5_hex(b"two")).unwrap().size, 3);
+        assert_eq!(a.usage(), (2, 6));
         let _ = fsx::remove_tree(&d);
     }
 
