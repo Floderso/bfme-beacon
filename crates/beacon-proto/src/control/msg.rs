@@ -4,6 +4,7 @@ use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
+use super::game_config::{ConfigStatus, GameConfig};
 use super::{base64_decode, base64_encode, decode_msg, encode_msg, Error, CHUNK_MAX};
 use crate::fingerprint::FileEntry;
 use crate::relay::RelayKey;
@@ -79,6 +80,16 @@ pub enum ClientMsg {
         rtt_ms: Option<u32>,
         /// Relay packet loss in percent (0–100), if measured.
         loss_pct: Option<u8>,
+        /// Readiness for the lobby's game configuration (omitted by launchers
+        /// without mod support).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<ConfigStatus>,
+    },
+    /// Host only: sets the lobby's game configuration (`null` = vanilla). Servers
+    /// without [`FEATURE_GAME_CONFIG`](super::FEATURE_GAME_CONFIG) ignore it.
+    SetGameConfig {
+        /// The configuration ([`GameConfig::finalize`]d by the host).
+        config: Option<Box<GameConfig>>,
     },
     /// Any message type this version does not know. Never sent; produced by
     /// decoding an unknown `"t"` so that newer peers stay compatible.
@@ -104,6 +115,11 @@ pub enum ServerMsg {
         motd: String,
         /// This player is the host.
         you_are_host: bool,
+        /// Optional protocol features of this server (e.g.
+        /// [`FEATURE_GAME_CONFIG`](super::FEATURE_GAME_CONFIG)); missing from older
+        /// servers.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
     /// The complete current player list (sent on every change).
     Lobby {
@@ -135,6 +151,14 @@ pub enum ServerMsg {
     },
     /// One piece of a map file.
     Chunk(Chunk),
+    /// The lobby's game configuration: after the login and after every change.
+    GameConfig {
+        /// The configuration; `null` = vanilla (everybody's own installation).
+        config: Option<Box<GameConfig>>,
+        /// Name of the host who set it (empty after a server start).
+        #[serde(default)]
+        by: String,
+    },
     /// Start BFME now.
     Launch,
     /// Answer to `ping`.
@@ -203,6 +227,10 @@ pub struct Player {
     pub in_game: bool,
     /// This player is the host.
     pub is_host: bool,
+    /// The player's readiness for the game configuration (`None`: not reported,
+    /// e.g. a launcher without mod support).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<ConfigStatus>,
 }
 
 /// One file of a map in the repository manifest.
@@ -328,6 +356,8 @@ pub enum ErrorCode {
     RateLimited,
     /// Internal server error.
     Internal,
+    /// Not every player is ready for the lobby's game configuration.
+    NotReady,
     /// A code this version does not know.
     #[serde(other)]
     Unknown,

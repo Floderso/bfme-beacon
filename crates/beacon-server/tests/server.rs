@@ -323,6 +323,7 @@ impl Client {
                 relay_port,
                 motd,
                 you_are_host,
+                ..
             } => Ok(Self {
                 name: name.into(),
                 stream,
@@ -610,6 +611,7 @@ async fn lobby_updates_ready_status_and_host_transfer() {
         in_game: true,
         rtt_ms: Some(25),
         loss_pct: Some(1),
+        config: None,
     })
     .await;
     let players = a
@@ -657,6 +659,7 @@ async fn rtt_reports_do_not_flood_the_lobby() {
             in_game: false,
             rtt_ms: Some(rtt),
             loss_pct: None,
+            config: None,
         })
         .await;
         let until = Instant::now() + Duration::from_millis(60);
@@ -677,6 +680,7 @@ async fn rtt_reports_do_not_flood_the_lobby() {
         in_game: true,
         rtt_ms: Some(31),
         loss_pct: None,
+        config: None,
     })
     .await;
     let t0 = Instant::now();

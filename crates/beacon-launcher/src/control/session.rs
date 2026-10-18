@@ -407,6 +407,7 @@ pub async fn connect_once(
             relay_port,
             motd,
             you_are_host,
+            ..
         } => Welcome {
             session,
             key,
@@ -520,6 +521,7 @@ fn status_msg(r: StatusReport) -> ClientMsg {
         in_game: r.in_game,
         rtt_ms: r.rtt_ms,
         loss_pct: r.loss_pct,
+        config: None,
     }
 }
 

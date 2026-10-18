@@ -513,6 +513,7 @@ impl Lobby {
                 ready: m.ready,
                 in_game: m.in_game,
                 is_host: self.host == Some(*id),
+                config: None,
             })
             .collect()
     }

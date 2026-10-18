@@ -42,7 +42,16 @@ feature set.
   JSON messages `ClientMsg` / `ServerMsg` (`#[serde(tag = "t")]`, snake_case; the
   authoritative message list), `encode_msg`/`decode_msg` (60 KiB limit), `Chunk`
   (32 KiB raw), `ErrorCode`, path validation (`is_safe_rel_path`, depth ≤ 2;
-  `is_safe_file_name`), liveness constants.
+  `is_safe_file_name`; `is_safe_package_path`/`normalize_package_path`, depth ≤ 8,
+  lower case with `\`), liveness constants. Game configuration
+  (`docs/dev/mods.md`): `GameConfig` (package, language, layers and the expected
+  file set `(path, md5, size, dir)`; `finalize` sorts, sets the BLAKE3-derived `id`
+  and `validate`s every bound: ≤ 512 files, ≤ 4 GiB per file, safe normalised
+  paths, no `wsock32.dll` in the game folder), `ConfigStatus` (a player's
+  readiness: ready / preparing % / missing n / error), `FEATURE_GAME_CONFIG`
+  (announced in `welcome.features`), `set_game_config` / `game_config`,
+  `status.config`, `lobby.players[].config`, `ErrorCode::NotReady`. New fields are
+  optional and left out when empty, so older peers keep working.
 * **`fingerprint`** (§8, feature `control`) — `FileEntry`, `Fingerprint`,
   deterministic `combine` (BLAKE3 derive-key mode, documented byte layout),
   `FileEntry::build_id`, `normalize_path`, `hash_hex`, and `beacon_serial(name)`

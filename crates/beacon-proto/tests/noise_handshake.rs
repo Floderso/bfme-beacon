@@ -118,6 +118,7 @@ fn full_handshake_and_json_exchange() {
         relay_port: 24800,
         motd: "Welcome to Middle-earth".into(),
         you_are_host: true,
+        features: Vec::new(),
     };
     send_json(&mut server, &welcome.to_json().unwrap(), &mut wire);
     let got = ServerMsg::from_json(&recv_json(&mut client, &mut client_dec, &mut wire)).unwrap();

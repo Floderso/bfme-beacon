@@ -31,14 +31,33 @@
 //! `fingerprint_files{name, files, complete}` (or `error{unknown_player}`).
 //! `complete` is `false` if the list had to be cut to fit into one message.
 //!
+//! Game configuration (`docs/dev/mods.md`): servers that announce
+//! [`FEATURE_GAME_CONFIG`] in `welcome.features` accept the host's
+//! `set_game_config{config}` ([`GameConfig`], `null` = vanilla), send
+//! `game_config{config, by}` after the login and after every change, take each
+//! player's readiness ([`ConfigStatus`]) from `status.config`, show it in
+//! `lobby.players[].config` and refuse `launch_all` (`not_ready`) until every player
+//! is ready for the current configuration.
+//!
 //! The `tests/noise_handshake.rs` integration test shows the complete sequence with
 //! `snow`.
 
+mod game_config;
 mod msg;
 mod path;
 
+pub use game_config::{
+    is_md5_hex, is_valid_config_id, is_valid_guid, is_valid_language, is_valid_version, ConfigError,
+    ConfigFile, ConfigState, ConfigStatus, FileDir, GameConfig, PackageRef, CONFIG_ID_LEN,
+    FEATURE_GAME_CONFIG, ID_CONTEXT, MAX_CONFIG_FILES, MAX_CONFIG_FILE_SIZE, MAX_CONFIG_LAYERS,
+    MAX_CONFIG_TEXT_CHARS, MAX_CONFIG_TOTAL_SIZE, MAX_GUID_LEN, MAX_STATUS_TEXT_CHARS,
+    MAX_VERSION_LEN, RESERVED_HOOK_NAME, VANILLA_CONFIG_ID,
+};
 pub use msg::{Chunk, ClientMsg, ErrorCode, MapFile, MapInfo, Player, ServerMsg};
-pub use path::{is_safe_file_name, is_safe_rel_path, MAX_PATH_DEPTH};
+pub use path::{
+    is_safe_file_name, is_safe_package_path, is_safe_rel_path, normalize_package_path,
+    MAX_PACKAGE_PATH_DEPTH, MAX_PATH_DEPTH,
+};
 
 use std::fmt;
 use std::time::Duration;

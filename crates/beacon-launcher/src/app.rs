@@ -1063,7 +1063,11 @@ impl Inner {
                     self.notice(NoticeLevel::Info, "the host started the game");
                 }
             }
-            ServerMsg::Welcome { .. } | ServerMsg::Pong { .. } | ServerMsg::Kick { .. } | ServerMsg::Unknown => {}
+            ServerMsg::Welcome { .. }
+            | ServerMsg::GameConfig { .. }
+            | ServerMsg::Pong { .. }
+            | ServerMsg::Kick { .. }
+            | ServerMsg::Unknown => {}
         }
     }
 

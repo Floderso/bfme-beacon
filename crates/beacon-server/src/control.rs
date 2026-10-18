@@ -388,6 +388,7 @@ async fn handle_connection(
         relay_port: hub.relay_port(),
         motd: hub.settings().motd.clone(),
         you_are_host: joined.is_host,
+        features: Vec::new(),
     };
     let crate::hub::Joined {
         id,
@@ -569,11 +570,12 @@ async fn handle_msg(
             in_game,
             rtt_ms,
             loss_pct,
+            ..
         } => {
             hub.set_status(id, in_game, rtt_ms, loss_pct);
             Ok(())
         }
-        ClientMsg::Unknown => {
+        ClientMsg::SetGameConfig { .. } | ClientMsg::Unknown => {
             debug!("ignoring an unknown message type");
             Ok(())
         }

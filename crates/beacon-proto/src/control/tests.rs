@@ -92,6 +92,7 @@ fn client_messages_exact_json() {
                 in_game: false,
                 rtt_ms: Some(42),
                 loss_pct: Some(3),
+                config: None,
             },
             r#"{"t":"status","in_game":false,"rtt_ms":42,"loss_pct":3}"#,
         ),
@@ -131,6 +132,7 @@ fn server_messages_exact_json() {
         relay_port: 24800,
         motd: "Hi".into(),
         you_are_host: true,
+        features: Vec::new(),
     };
     let player = Player {
         name: "Frodo".into(),
@@ -141,6 +143,7 @@ fn server_messages_exact_json() {
         ready: true,
         in_game: false,
         is_host: true,
+        config: None,
     };
     let map = MapInfo::new(
         "Helms Deep",
@@ -236,6 +239,7 @@ fn error_codes_json() {
         (ErrorCode::BadOffset, "bad_offset"),
         (ErrorCode::RateLimited, "rate_limited"),
         (ErrorCode::Internal, "internal"),
+        (ErrorCode::NotReady, "not_ready"),
     ];
     for (code, s) in all {
         assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{s}\""));
@@ -285,7 +289,8 @@ fn forward_compatibility() {
         ClientMsg::Status {
             in_game: true,
             rtt_ms: None,
-            loss_pct: None
+            loss_pct: None,
+            config: None,
         }
     );
     // Field order does not matter, the tag may come last.
@@ -689,4 +694,202 @@ fn error_display_and_source() {
     for e in errs {
         assert!(!e.to_string().is_empty());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Game configuration messages
+// ---------------------------------------------------------------------------
+
+fn game_config() -> GameConfig {
+    GameConfig {
+        id: String::new(),
+        guid: "official-0".into(),
+        version: "7.0.5".into(),
+        name: "Patch 2.22".into(),
+        author: "The 2.22 Team".into(),
+        language: "EN".into(),
+        layers: vec![PackageRef {
+            guid: "official-0".into(),
+            version: "7.0.5".into(),
+            name: "Patch 2.22".into(),
+            author: "The 2.22 Team".into(),
+            kind: 0,
+        }],
+        files: vec![
+            ConfigFile {
+                path: "_patch222.big".into(),
+                md5: "1".repeat(32),
+                size: 7,
+                dir: FileDir::Game,
+            },
+            ConfigFile {
+                path: "mod.big".into(),
+                md5: "2".repeat(32),
+                size: 0,
+                dir: FileDir::Mod,
+            },
+        ],
+    }
+    .finalize()
+    .unwrap()
+}
+
+#[test]
+fn game_config_messages_round_trip() {
+    let config = game_config();
+    let set = ClientMsg::SetGameConfig {
+        config: Some(Box::new(config.clone())),
+    };
+    let json = client_json(&set);
+    assert!(json.starts_with(r#"{"t":"set_game_config","config":{"id":""#), "{json}");
+    // The game folder is the default and left out; the mod folder is named.
+    assert!(json.contains(r#"{"path":"_patch222.big","md5":"11111111111111111111111111111111","size":7}"#));
+    assert!(json.contains(r#""size":0,"dir":"mod"}"#));
+    assert_eq!(ClientMsg::from_json(json.as_bytes()).unwrap(), set);
+    let vanilla = ClientMsg::SetGameConfig { config: None };
+    assert_eq!(client_json(&vanilla), r#"{"t":"set_game_config","config":null}"#);
+    assert_eq!(ClientMsg::from_json(br#"{"t":"set_game_config","config":null}"#).unwrap(), vanilla);
+
+    let announce = ServerMsg::GameConfig {
+        config: Some(Box::new(config.clone())),
+        by: "Frodo".into(),
+    };
+    let json = server_json(&announce);
+    assert!(json.starts_with(r#"{"t":"game_config","config":{"#));
+    let back = ServerMsg::from_json(json.as_bytes()).unwrap();
+    assert_eq!(back, announce);
+    let ServerMsg::GameConfig { config: Some(c), .. } = back else {
+        panic!("wrong message");
+    };
+    assert_eq!(c.validate(), Ok(()), "the id survives the round trip");
+    assert_eq!(
+        ServerMsg::from_json(br#"{"t":"game_config","config":null}"#).unwrap(),
+        ServerMsg::GameConfig {
+            config: None,
+            by: String::new()
+        }
+    );
+}
+
+#[test]
+fn readiness_in_status_and_lobby() {
+    let status = ClientMsg::Status {
+        in_game: false,
+        rtt_ms: None,
+        loss_pct: None,
+        config: Some(ConfigStatus {
+            id: "a".repeat(32),
+            state: ConfigState::Preparing,
+            progress: Some(40),
+            missing: None,
+            text: None,
+        }),
+    };
+    let json = client_json(&status);
+    assert_eq!(
+        json,
+        format!(
+            r#"{{"t":"status","in_game":false,"rtt_ms":null,"loss_pct":null,"config":{{"id":"{}","state":"preparing","progress":40}}}}"#,
+            "a".repeat(32)
+        )
+    );
+    assert_eq!(ClientMsg::from_json(json.as_bytes()).unwrap(), status);
+    // A state from a newer launcher is kept as Unknown.
+    let newer = ClientMsg::from_json(
+        br#"{"t":"status","in_game":false,"config":{"id":"vanilla","state":"teleporting"}}"#,
+    )
+    .unwrap();
+    let ClientMsg::Status { config: Some(c), .. } = newer else {
+        panic!("wrong message");
+    };
+    assert_eq!(c.state, ConfigState::Unknown);
+
+    let player = Player {
+        name: "Sam".into(),
+        vip: Ipv4Addr::new(198, 18, 0, 3),
+        rtt_ms: None,
+        loss_pct: None,
+        fingerprint: None,
+        ready: false,
+        in_game: false,
+        is_host: false,
+        config: Some(ConfigStatus {
+            id: "b".repeat(32),
+            state: ConfigState::Missing,
+            progress: None,
+            missing: Some(3),
+            text: Some("_patch222.big".into()),
+        }),
+    };
+    let lobby = ServerMsg::Lobby { players: vec![player] };
+    assert_eq!(ServerMsg::from_json(&lobby.to_json().unwrap()).unwrap(), lobby);
+}
+
+#[test]
+fn game_config_backward_compatibility() {
+    // An older server's welcome has no features; an older launcher's player entry
+    // and status have no readiness.
+    let old_welcome = format!(
+        r#"{{"t":"welcome","session":1,"key":"{}","vip":"198.18.0.2","relay_port":1,"motd":"","you_are_host":false}}"#,
+        "00".repeat(32)
+    );
+    let ServerMsg::Welcome { features, .. } = ServerMsg::from_json(old_welcome.as_bytes()).unwrap() else {
+        panic!("wrong message");
+    };
+    assert!(features.is_empty());
+    let welcome = ServerMsg::Welcome {
+        session: 1,
+        key: key(),
+        vip: Ipv4Addr::new(198, 18, 0, 2),
+        relay_port: 1,
+        motd: String::new(),
+        you_are_host: false,
+        features: vec![FEATURE_GAME_CONFIG.to_owned()],
+    };
+    assert!(server_json(&welcome).ends_with(r#""you_are_host":false,"features":["game_config"]}"#));
+    let old_player = br#"{"t":"lobby","players":[{"name":"a","vip":"198.18.0.2","rtt_ms":null,"loss_pct":null,"fingerprint":null,"ready":false,"in_game":false,"is_host":true}]}"#;
+    let ServerMsg::Lobby { players } = ServerMsg::from_json(old_player).unwrap() else {
+        panic!("wrong message");
+    };
+    assert_eq!(players[0].config, None);
+    // What an older launcher makes of the new message: unknown, ignored.
+    let json = ServerMsg::GameConfig {
+        config: Some(Box::new(game_config())),
+        by: String::new(),
+    }
+    .to_json()
+    .unwrap();
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    #[serde(tag = "t", rename_all = "snake_case")]
+    enum OldServerMsg {
+        Launch,
+        #[serde(other)]
+        Unknown,
+    }
+    assert_eq!(serde_json::from_slice::<OldServerMsg>(&json).unwrap(), OldServerMsg::Unknown);
+    assert_eq!(
+        serde_json::from_slice::<OldServerMsg>(br#"{"t":"launch"}"#).unwrap(),
+        OldServerMsg::Launch
+    );
+}
+
+#[test]
+fn largest_config_fits_into_one_message() {
+    // The most files with typical paths still fit (the server re-encodes with `by`).
+    let mut config = game_config();
+    config.files = (0..MAX_CONFIG_FILES)
+        .map(|i| ConfigFile {
+            path: format!("data\\movies\\{i:04}_with_alpha.vp6"),
+            md5: format!("{i:032x}"),
+            size: 100_000_000,
+            dir: FileDir::Game,
+        })
+        .collect();
+    let config = config.finalize().unwrap();
+    let msg = ServerMsg::GameConfig {
+        config: Some(Box::new(config)),
+        by: "Gandalf12345".into(),
+    };
+    let len = msg.to_json().map(|j| j.len());
+    assert!(matches!(len, Ok(n) if n <= MAX_MSG_LEN), "{len:?}");
 }
