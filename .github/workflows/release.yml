@@ -322,7 +322,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          flags=()
+          # Always a draft: the maintainer checks the files and publishes by hand.
+          flags=(--draft)
           if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
           gh release create "$TAG" dist/* \
             --verify-tag \
