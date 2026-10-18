@@ -197,6 +197,8 @@
     launch_failed: 'BFME konnte nicht gestartet werden.',
     busy: 'Das läuft bereits – bitte einen Moment warten.',
     io: 'Datei- oder Systemfehler.',
+    not_ready: 'Die Spielversion der Lobby ist bei dir noch nicht vorbereitet.',
+    unsupported: 'Der Server unterstützt die Auswahl einer Spielversion noch nicht (beacon-server aktualisieren).',
     forbidden: 'Zugriff verweigert.',
     bad_request: 'Ungültige Anfrage.',
     not_found: 'Unbekannte Anfrage.',
@@ -231,6 +233,8 @@
     path_not_absolute: 'Bitte einen vollständigen Pfad angeben, zum Beispiel C:\\Spiele\\BFME.',
     resolution_range: `Breite und Höhe müssen zwischen ${RES_MIN} und ${RES_MAX} Pixeln liegen.`,
     redundancy_range: 'Die Redundanz muss 1, 2 oder 3 sein.',
+    config_key: 'Ungültige Auswahl der Spielversion.',
+    language_code: 'Ungültige Sprachvariante.',
   };
 
   const REJECTED = {
@@ -246,6 +250,7 @@
     not_host: 'Das darf nur der Host.',
     bad_request: 'Der Server hat eine Anfrage nicht verstanden.',
     internal: 'Interner Fehler auf dem Server.',
+    not_ready: 'Noch nicht alle Spieler haben die Spielversion vorbereitet.',
   };
 
   /** German text of an API error. */
@@ -782,7 +787,8 @@
     navCount.hidden = !(connected && st.players.length);
     setText(navCount, String(st.players.length));
     renderLobbyButtons(st);
-    if (changed('players', [st.players, srv && srv.vip, srv && srv.you_are_host, st.peer_files, st.fingerprint.state])) {
+    renderMods(st);
+    if (changed('players', [st.players, srv && srv.vip, srv && srv.you_are_host, st.peer_files, st.fingerprint.state, st.mods.lobby])) {
       renderPlayers(st);
     }
     if (changed('data-warning', [st.players, srv && srv.vip, st.peer_files])) renderDataWarning(st);
@@ -798,12 +804,26 @@
     btnReady.setAttribute('aria-pressed', String(ready));
     btnReady.disabled = !connected || busy.has('btn-ready');
     const running = !!(st.game_process && st.game_process.running);
+    const lobbyCfg = st.mods.lobby;
+    const notPrepared = !!(lobbyCfg && st.mods.local.state !== 'ready');
     const launch = $('btn-launch');
     setText(launch, running ? 'BFME läuft' : 'BFME starten');
-    launch.disabled = !connected || running || busy.has('btn-launch');
+    launch.disabled = !connected || running || notPrepared || busy.has('btn-launch');
+    launch.title = notPrepared ? 'Die Spielversion der Lobby wird noch vorbereitet.' : '';
     const all = $('btn-launch-all');
-    all.hidden = !(connected && st.server && st.server.you_are_host);
-    all.disabled = busy.has('btn-launch-all');
+    const amHost = !!(connected && st.server && st.server.you_are_host);
+    all.hidden = !amHost;
+    let reason = '';
+    if (amHost && lobbyCfg) {
+      const waiting = st.players.filter((p) => !(p.config && p.config.id === lobbyCfg.id && p.config.state === 'ready'));
+      if (waiting.length) {
+        reason = `„Alle starten“ ist möglich, sobald alle Spieler „${lobbyCfg.name} ${lobbyCfg.version}“ vorbereitet haben. Noch nicht bereit: ${waiting.map((p) => p.name).join(', ')}.`;
+      }
+    }
+    all.disabled = busy.has('btn-launch-all') || !!reason;
+    const reasonNode = $('launch-all-reason');
+    reasonNode.hidden = !reason;
+    setText(reasonNode, reason);
     $('btn-sync').disabled = !connected || st.maps.sync.running || !st.maps.maps_dir || busy.has('btn-sync');
   }
 
@@ -834,6 +854,8 @@
   function createPlayerRow() {
     const nameCell = el('th', { scope: 'row', class: 'p-name' });
     const ping = el('td', { class: 'p-ping' });
+    const versionBadge = el('span', { class: 'badge' });
+    const version = el('td', { class: 'p-version' }, versionBadge);
     const dataBadge = el('span', { class: 'badge' });
     const compare = el('button', { type: 'button', class: 'link-btn', text: 'Dateien vergleichen' });
     const summary = el('summary');
@@ -843,8 +865,8 @@
     const status = el('td', { class: 'p-status' });
     const kick = el('button', { type: 'button', class: 'btn btn-small btn-danger', text: 'Kicken' });
     const actions = el('td', { class: 'p-actions' }, kick);
-    const tr = el('tr', null, nameCell, ping, data, status, actions);
-    tr.refs = { nameCell, ping, dataBadge, compare, details, summary, files, status, kick };
+    const tr = el('tr', null, nameCell, ping, version, data, status, actions);
+    tr.refs = { nameCell, ping, versionBadge, dataBadge, compare, details, summary, files, status, kick };
     compare.addEventListener('click', () => {
       const name = tr.dataset.key;
       run(null, async () => {
@@ -881,6 +903,11 @@
       pingParts.push(el('div', { class: `small ${cls}`, text: `${NF.format(p.loss_pct)} % Verlust` }));
     }
     fill(r.ping, ...pingParts);
+
+    const [vcls, vtext, vtitle] = modStatus(p, ctx.lobby);
+    r.versionBadge.className = `badge ${vcls}`.trim();
+    setText(r.versionBadge, vtext);
+    r.versionBadge.title = vtitle;
 
     const ds = dataStatus(p, ctx.host, { isMe, fpComputing: ctx.fpComputing });
     r.dataBadge.className = `badge ${ds.cls}`.trim();
@@ -937,6 +964,7 @@
       amHost: !!(st.server && st.server.you_are_host),
       peerFiles: st.peer_files || {},
       fpComputing: st.fingerprint.state === 'computing',
+      lobby: st.mods.lobby,
     };
     syncRows($('players-body'), st.players, (p) => p.name, createPlayerRow, (tr, p) => updatePlayerRow(tr, p, ctx));
     setText($('player-count'), st.players.length ? `(${st.players.length})` : '');
@@ -977,6 +1005,257 @@
     }
     fill(box, ...parts);
     box.hidden = false;
+  }
+
+  // ------------------------------------------------------------------- mods
+  const BFMELADDER = 'https://bfmeladder.com/download';
+  const PHASES = {
+    checking: 'Prüfe vorhandene Dateien …',
+    importing: 'Kopiere Dateien aus deinen Ordnern in Beacons Speicher …',
+    downloading: 'Lade Dateien aus dem BFME Workshop …',
+    linking: 'Lege den Instanzordner an …',
+  };
+  const KINDS = { 0: 'Patch', 1: 'Mod', 2: 'Erweiterung' };
+  const LANGS = {
+    EN: 'Englisch',
+    DE: 'Deutsch',
+    FR: 'Französisch',
+    ES: 'Spanisch',
+    IT: 'Italienisch',
+    NL: 'Niederländisch',
+    PL: 'Polnisch',
+    NO: 'Norwegisch',
+    SV: 'Schwedisch',
+    RU: 'Russisch',
+    TR: 'Türkisch',
+  };
+  /** The host changed the selection and has not applied it yet. */
+  let modSelectDirty = false;
+
+  const supportsMods = (st) => !!(st.server && (st.server.features || []).includes('game_config'));
+  const isHttps = (u) => typeof u === 'string' && /^https:\/\/[^\s]+$/.test(u);
+
+  /** A player's readiness for the lobby's configuration: [badge class, text, title]. */
+  function modStatus(p, lobby) {
+    const c = p.config;
+    if (!lobby) {
+      if (c && c.id === 'vanilla') return ['', 'Vanilla', 'Spielt mit der eigenen Installation.'];
+      return ['', '–', ''];
+    }
+    if (!c) return ['warn', 'keine Rückmeldung', 'Noch keine Rückmeldung – vermutlich eine ältere Beacon-Version ohne Mod-Unterstützung.'];
+    if (c.id !== lobby.id) return ['info', 'prüft …', 'Beginnt mit der neuen Spielversion.'];
+    switch (c.state) {
+      case 'ready':
+        return ['ok', '✓ bereit', 'Die Spielversion ist vollständig vorbereitet.'];
+      case 'preparing':
+        return ['info', `${NF.format(c.progress || 0)} %`, 'Bereitet die Spielversion vor.'];
+      case 'missing':
+        return ['warn', c.missing ? `${NF.format(c.missing)} fehlen` : 'Dateien fehlen', c.text ? `Fehlt: ${c.text}` : 'Es fehlen Dateien.'];
+      case 'error':
+        return ['err', 'Fehler', c.text || 'Fehler beim Vorbereiten.'];
+      default:
+        return ['', '?', ''];
+    }
+  }
+
+  function renderMods(st) {
+    const connected = isConnected(st);
+    const m = st.mods;
+    const amHost = !!(connected && st.server && st.server.you_are_host);
+    if (changed('mod-current', [m.lobby, connected, supportsMods(st), m.catalog])) renderModCurrent(st);
+    if (changed('mod-host', [m.catalog, m.catalog_loaded, amHost, supportsMods(st), m.lobby, m.game_language])) renderModHost(st, amHost);
+    if (changed('mod-local', [m.local, m.lobby && m.lobby.id, connected])) renderModLocal(st);
+  }
+
+  function renderModCurrent(st) {
+    const m = st.mods;
+    const box = $('mod-current');
+    const tag = $('mod-badge');
+    if (!isConnected(st)) {
+      fill(box, el('p', { class: 'muted', text: 'Nicht verbunden.' }));
+      tag.hidden = true;
+      return;
+    }
+    const l = m.lobby;
+    if (!l) {
+      fill(
+        box,
+        el('p', null, el('strong', { text: 'Vanilla' }), ' – jeder startet BFME aus seiner eigenen Installation, wie bisher.'),
+        supportsMods(st)
+          ? null
+          : el('p', { class: 'small muted', text: 'Dieser Server unterstützt die Auswahl einer Spielversion noch nicht (beacon-server aktualisieren).' }),
+      );
+      tag.hidden = false;
+      tag.className = 'badge';
+      setText(tag, 'Vanilla');
+      return;
+    }
+    tag.hidden = false;
+    tag.className = 'badge info';
+    setText(tag, LANGS[l.language] || l.language);
+    const entry = m.catalog.find((e) => e.guid === l.guid && e.version === l.version);
+    const others = (l.layers || []).filter((x) => x.guid !== l.guid && !x.guid.startsWith('original-'));
+    const links = entry ? entry.social_links.filter(isHttps).slice(0, 4) : [];
+    const link = (href, text) => el('a', { href, target: '_blank', rel: 'noopener noreferrer', dir: 'ltr', text });
+    fill(
+      box,
+      el('p', { class: 'mod-title' }, el('bdi', { class: 'mod-name', text: l.name }), ' ', el('span', { class: 'mod-version', text: l.version })),
+      l.author ? el('p', { class: 'small' }, 'von ', bdi(l.author)) : null,
+      others.length ? el('p', { class: 'small' }, 'mit ', ...others.flatMap((x, i) => [i ? ', ' : null, bdi(`${x.name} ${x.version}`)])) : null,
+      el('p', {
+        class: 'small muted',
+        text: `${count(l.files, 'Datei', 'Dateien')}${l.total_size ? `, ${fmtBytes(l.total_size)}` : ''} · Sprachvariante ${LANGS[l.language] || l.language}${l.uses_mod_dir ? ' · startet mit -mod' : ''}`,
+      }),
+      el(
+        'p',
+        { class: 'small attribution' },
+        'Aus dem BFME Workshop (BFME Foundation Project) – ',
+        link(BFMELADDER, 'bfmeladder.com'),
+        ...links.flatMap((u) => [' · ', link(u, u.replace(/^https:\/\//, ''))]),
+      ),
+      l.set_by ? el('p', { class: 'small muted' }, 'Festgelegt von ', bdi(l.set_by)) : null,
+    );
+  }
+
+  function renderModHost(st, amHost) {
+    const form = $('mod-host');
+    const m = st.mods;
+    form.hidden = !(amHost && supportsMods(st));
+    if (form.hidden) return;
+    const sel = $('mod-select');
+    const current = m.lobby ? `${m.lobby.guid}@${m.lobby.version}` : '';
+    const keep = modSelectDirty ? sel.value : current;
+    const options = [el('option', { value: '', text: 'Vanilla – eigene Installation (Standard)' })];
+    for (const e of m.catalog) {
+      const kind = KINDS[e.kind] || 'Paket';
+      const label = `${e.name} ${e.version}${e.with.length ? ` (+ ${e.with.join(', ')})` : ''} – ${kind}${e.active_in_aio ? ' · aktiv im Workshop-Launcher' : ''}`;
+      options.push(el('option', { value: e.key, disabled: !!e.problem, title: e.problem || null, text: e.problem ? `${label} – nicht verfügbar` : label }));
+    }
+    fill(sel, ...options);
+    sel.value = [...sel.options].some((o) => o.value === keep && !o.disabled) ? keep : current;
+    renderModLang(st);
+    const usable = m.catalog.filter((e) => !e.problem).length;
+    const hint = $('mod-select-hint');
+    if (!m.catalog_loaded) setText(hint, 'Die Bibliothek des BFME-Workshop-Launchers wird gelesen …');
+    else if (!m.catalog.length)
+      setText(
+        hint,
+        'Keine Pakete gefunden. Beacon liest die Bibliothek des BFME-Workshop-Launchers (All-in-One-Launcher); installiere ein Paket dort einmal, dann erscheint es hier.',
+      );
+    else
+      setText(
+        hint,
+        `${count(usable, 'Spielversion', 'Spielversionen')} aus der Bibliothek des BFME-Workshop-Launchers. Jeder Spieler bereitet die gewählte Version automatisch vor; Beacon verändert dabei keine Installation.`,
+      );
+  }
+
+  function renderModLang(st) {
+    const m = st.mods;
+    const lang = $('mod-lang');
+    const entry = m.catalog.find((e) => e.key === $('mod-select').value);
+    const keep = lang.value;
+    if (!entry) {
+      fill(lang, el('option', { value: '', text: '–' }));
+      lang.disabled = true;
+      return;
+    }
+    lang.disabled = false;
+    const langs = entry.languages.length ? entry.languages : ['EN'];
+    fill(lang, ...langs.map((c) => el('option', { value: c, text: LANGS[c] ? `${LANGS[c]} (${c})` : c })));
+    let preferred = entry.default_language;
+    if (m.lobby && m.lobby.guid === entry.guid && m.lobby.version === entry.version) preferred = m.lobby.language;
+    if (modSelectDirty && langs.includes(keep)) preferred = keep;
+    lang.value = langs.includes(preferred) ? preferred : langs[0];
+  }
+
+  function renderModLocal(st) {
+    const m = st.mods;
+    const local = m.local;
+    const box = $('mod-local');
+    const progress = $('mod-progress');
+    const active = isConnected(st) && !!m.lobby;
+    progress.hidden = local.state !== 'preparing';
+    $('btn-mod-cancel').hidden = local.state !== 'preparing';
+    $('btn-mod-retry').hidden = !['missing', 'error'].includes(local.state);
+    $('mod-actions').hidden = !active || !['preparing', 'missing', 'error'].includes(local.state);
+    $('mod-import').hidden = !active || local.state === 'ready';
+    if (!active) {
+      fill(box);
+      return;
+    }
+    switch (local.state) {
+      case 'preparing': {
+        const p = local.progress || {};
+        const pct = p.percent || 0;
+        progress.value = pct;
+        fill(
+          box,
+          el('p', null, badge('info', `${NF.format(pct)} %`), ' ', PHASES[p.phase] || 'Bereite die Spielversion vor …'),
+          p.current ? el('p', { class: 'small muted' }, path(p.current)) : null,
+          p.bytes_total ? el('p', { class: 'small muted', text: `${fmtBytes(p.bytes_done)} von ${fmtBytes(p.bytes_total)}` }) : null,
+        );
+        break;
+      }
+      case 'ready':
+        fill(
+          box,
+          el('p', null, badge('ok', '✓ Bereit'), ' BFME startet aus dem Instanzordner ', path(local.game_dir), '.'),
+          local.link_mode === 'copy'
+            ? el('p', { class: 'small ping-ok', dir: 'auto', text: local.notice || 'Die Dateien wurden kopiert (harte Verknüpfungen sind hier nicht möglich).' })
+            : el('p', { class: 'small muted', text: 'Deine eigene BFME-Installation bleibt unverändert.' }),
+        );
+        break;
+      case 'missing': {
+        const files = (local.files || []).map((f) => f.path);
+        const list = fileList(files);
+        if (local.count > files.length) list.append(el('li', { text: `… insgesamt ${NF.format(local.count)}` }));
+        fill(
+          box,
+          el('p', null, badge('warn', count(local.count, 'Datei fehlt', 'Dateien fehlen')), ' Beacon hat sie in deinen Ordnern nicht gefunden:'),
+          list,
+          ...(local.notes || []).map((n) => el('p', { class: 'small', dir: 'auto', text: n })),
+          el('p', {
+            class: 'small',
+            text: 'So bekommst du sie: Installiere diese Version einmal im BFME-Workshop-Launcher (All-in-One-Launcher) und klicke dann auf „Erneut prüfen“ – oder importiere sie unten aus einem Ordner, der sie enthält.',
+          }),
+        );
+        break;
+      }
+      case 'error':
+        fill(box, el('p', null, badge('err', 'Fehler'), ' ', el('span', { dir: 'auto', text: local.message })));
+        break;
+      default:
+        fill(box);
+    }
+  }
+
+  function renderModStore(st) {
+    if (!changed('mod-store', st.mods.storage)) return;
+    const s = st.mods.storage;
+    let link = null;
+    if (s.link_mode === 'hardlink') link = badge('ok', 'harte Verknüpfungen – kein zusätzlicher Platz');
+    else if (s.link_mode === 'copy') link = el('span', null, badge('warn', 'Kopien'), ' ', el('span', { class: 'small muted', dir: 'auto', text: s.link_note || '' }));
+    kv($('mod-store'), [
+      ['Ordner', path(s.root)],
+      ['Gespeichert', `${count(s.store_files, 'Datei', 'Dateien')}, ${fmtBytes(s.store_bytes)}`],
+      ['Frei', s.free_bytes === null || s.free_bytes === undefined ? null : fmtBytes(s.free_bytes)],
+      ['Verknüpfung', link],
+    ]);
+    fill(
+      $('mod-instances'),
+      ...s.instances.map((i) =>
+        el(
+          'li',
+          null,
+          el('bdi', { class: 'mod-name', text: i.name }),
+          ` ${i.version} (${LANGS[i.language] || i.language}) `,
+          i.current ? badge('info', 'aktuell') : null,
+          i.complete ? null : badge('warn', 'unvollständig'),
+          el('span', { class: 'small muted', text: ` ${count(i.files, 'Datei', 'Dateien')}${i.link_mode === 'copy' ? `, belegt ${fmtBytes(i.bytes)}` : ''}` }),
+        ),
+      ),
+    );
+    $('mod-instances-empty').hidden = s.instances.length > 0;
   }
 
   // ------------------------------------------------------------------- chat
@@ -1140,10 +1419,11 @@
       src.className = 'badge warn';
       setText(src, 'Spiel nicht gefunden');
     }
-    if (!settingsDirty && changed('settings-form', st.settings)) fillSettings(st.settings);
+    if (!settingsDirty && changed('settings-form', [st.settings, st.mods.settings])) fillSettings(st.settings, st.mods.settings);
+    renderModStore(st);
   }
 
-  function fillSettings(s) {
+  function fillSettings(s, ms) {
     $('s-gamedir').value = s.game_dir || '';
     $('s-windowed').checked = !!s.launch.windowed;
     const sel = $('s-res');
@@ -1161,7 +1441,18 @@
       const v = s.redundancy[k];
       $(`s-red-${k}`).value = v === null || v === undefined ? '' : String(v);
     }
-    clearFieldErrors('s-gamedir', 's-res');
+    $('s-modsdir').value = ms.dir_is_default ? '' : ms.dir;
+    $('s-modsdir').placeholder = ms.dir_is_default ? `leer lassen = ${ms.dir}` : 'leer lassen = im Beacon-Datenordner';
+    $('s-importdirs').value = (ms.import_dirs || []).join('\n');
+    $('s-workshop').checked = !!ms.workshop_downloads;
+    $('s-workshop').disabled = !ms.workshop_available;
+    setText(
+      $('s-workshop-hint'),
+      ms.workshop_available
+        ? 'Lädt fehlende Paketdateien von workshop-files.bfmeladder.com (MD5-geprüft, höchstens zwei gleichzeitig). Spieldateien von EA und Programmdateien lädt Beacon nie herunter.'
+        : 'Wartet auf die Zustimmung des BFME-Foundation-Teams.',
+    );
+    clearFieldErrors('s-gamedir', 's-res', 's-modsdir', 's-importdirs');
     $('settings-error').hidden = true;
   }
 
@@ -1492,6 +1783,56 @@
       });
     });
 
+    // Game configuration.
+    $('mod-select').addEventListener('change', () => {
+      modSelectDirty = true;
+      if (S) renderModLang(S);
+    });
+    $('mod-lang').addEventListener('change', () => {
+      modSelectDirty = true;
+    });
+    $('mod-host').addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const key = $('mod-select').value || null;
+      const language = key ? $('mod-lang').value || null : null;
+      run($('btn-mod-apply'), async () => {
+        await api('mods/select', { key, language });
+        modSelectDirty = false;
+        toast(key ? 'Spielversion für alle festgelegt. Alle Spieler bereiten sie jetzt vor.' : 'Zurück auf Vanilla: jeder spielt mit seiner eigenen Installation.', 'success');
+      });
+    });
+    $('btn-mod-reload').addEventListener('click', () => run($('btn-mod-reload'), () => api('mods/reload', {})));
+    $('btn-mod-retry').addEventListener('click', () => run($('btn-mod-retry'), () => api('mods/retry', {})));
+    $('btn-mod-cancel').addEventListener('click', () => run($('btn-mod-cancel'), () => api('mods/cancel', {})));
+    $('mod-import-path').addEventListener('input', () => clearFieldErrors('mod-import-path'));
+    $('mod-import-form').addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      clearFieldErrors('mod-import-path');
+      const dir = $('mod-import-path').value.trim();
+      if (!isAbsolutePath(dir)) {
+        fieldError('mod-import-path', REASONS.path_not_absolute);
+        $('mod-import-path').focus();
+        return;
+      }
+      run(
+        $('btn-mod-import'),
+        async () => {
+          await api('mods/import', { path: dir });
+          $('mod-import-path').value = '';
+          toast('Ordner hinzugefügt – Beacon sucht dort nach den fehlenden Dateien.', 'success');
+        },
+        (err) => fieldError('mod-import-path', err.kind === 'invalid_input' && !err.reason ? `${errorText(err)} ${err.detail}` : errorText(err)),
+      );
+    });
+    $('btn-mod-cleanup').addEventListener('click', () => {
+      if (!window.confirm('Nicht benötigte Instanzordner und gespeicherte Dateien entfernen?\n\nDie aktuelle Spielversion der Lobby bleibt erhalten. Später benötigte Dateien importiert Beacon bei Bedarf erneut.')) return;
+      run($('btn-mod-cleanup'), async () => {
+        const res = await api('mods/cleanup', {});
+        const r = res.removed || {};
+        toast(`Aufgeräumt: ${count(r.instances || 0, 'Instanz', 'Instanzen')}, ${count(r.files || 0, 'Datei', 'Dateien')}, ${fmtBytes(r.bytes || 0)} frei.`, 'success');
+      });
+    });
+
     // Settings.
     const form = $('settings-form');
     form.addEventListener('input', markSettingsDirty);
@@ -1503,11 +1844,11 @@
     $('s-discard').addEventListener('click', () => {
       settingsDirty = false;
       setText($('s-status'), '');
-      if (S) fillSettings(S.settings);
+      if (S) fillSettings(S.settings, S.mods.settings);
     });
     form.addEventListener('submit', (ev) => {
       ev.preventDefault();
-      clearFieldErrors('s-gamedir', 's-res');
+      clearFieldErrors('s-gamedir', 's-res', 's-modsdir', 's-importdirs');
       $('settings-error').hidden = true;
       const sel = $('s-res').value;
       let xres = null;
@@ -1530,6 +1871,21 @@
         $('s-gamedir').focus();
         return;
       }
+      const modsDir = $('s-modsdir').value.trim();
+      if (modsDir && !isAbsolutePath(modsDir)) {
+        fieldError('s-modsdir', REASONS.path_not_absolute);
+        $('s-modsdir').focus();
+        return;
+      }
+      const importDirs = $('s-importdirs')
+        .value.split('\n')
+        .map((x) => x.trim())
+        .filter(Boolean);
+      if (importDirs.some((d) => !isAbsolutePath(d))) {
+        fieldError('s-importdirs', REASONS.path_not_absolute);
+        $('s-importdirs').focus();
+        return;
+      }
       const red = (k) => {
         const v = $(`s-red-${k}`).value;
         return v === '' ? null : Number(v);
@@ -1540,7 +1896,10 @@
         name_sync: $('s-namesync').checked,
         auto_launch_on_host_start: $('s-autolaunch').checked,
         redundancy: { lobby: red('lobby'), game: red('game'), other: red('other') },
+        mods_dir: modsDir,
+        import_dirs: importDirs,
       };
+      if (S && S.mods.settings.workshop_available) patch.workshop_downloads = $('s-workshop').checked;
       const submit = form.querySelector('button[type="submit"]');
       run(
         submit,
@@ -1554,6 +1913,8 @@
         },
         (err) => {
           if (err.field === 'game_dir') fieldError('s-gamedir', errorText(err));
+          else if (err.field === 'mods_dir') fieldError('s-modsdir', errorText(err));
+          else if (err.field === 'import_dirs') fieldError('s-importdirs', errorText(err));
           else if (err.field === 'launch') fieldError('s-res', errorText(err));
           else showCallout($('settings-error'), errorText(err), err.detail);
         },

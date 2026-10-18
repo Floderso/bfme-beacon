@@ -356,6 +356,7 @@ main {
 input[type="text"],
 input[type="password"],
 input[type="number"],
+textarea,
 select {
   width: 100%;
   padding: 9px 11px;
@@ -1135,5 +1136,97 @@ progress::-moz-progress-bar {
   .card,
   .callout {
     border: 1px solid CanvasText;
+  }
+}
+
+/* ---------------------------------------------------------------- mods */
+.mod-current p {
+  margin: 0 0 0.35rem;
+}
+
+.mod-title {
+  font-family: var(--font-head);
+  font-size: 1.15rem;
+}
+
+.mod-name {
+  color: var(--gold-strong);
+  font-weight: 600;
+}
+
+.mod-version {
+  color: var(--text-muted);
+}
+
+.attribution a {
+  color: var(--gold);
+}
+
+.mod-host {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.mod-host-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 1fr);
+  gap: 0.75rem;
+}
+
+.mod-host select {
+  width: 100%;
+}
+
+.mod-local {
+  margin-top: 0.75rem;
+}
+
+.mod-local:empty {
+  display: none;
+}
+
+.mod-card progress {
+  width: 100%;
+}
+
+.mod-import {
+  margin-top: 0.75rem;
+}
+
+.mod-import > summary {
+  cursor: pointer;
+  color: var(--gold);
+}
+
+.mod-instances {
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+}
+
+.mod-instances li {
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.launch-reason {
+  margin: 0 0 0.75rem;
+  color: var(--warn);
+}
+
+.p-version .badge {
+  white-space: nowrap;
+}
+
+textarea {
+  width: 100%;
+  resize: vertical;
+  font-family: var(--mono);
+}
+
+@media (max-width: 640px) {
+  .mod-host-fields {
+    grid-template-columns: 1fr;
   }
 }

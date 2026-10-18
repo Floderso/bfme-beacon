@@ -102,15 +102,62 @@
       <div class="lobby-actions">
         <button type="button" id="btn-ready" class="btn" aria-pressed="false">Bereit</button>
         <button type="button" id="btn-launch" class="btn btn-primary">BFME starten</button>
-        <button type="button" id="btn-launch-all" class="btn btn-gold" hidden>Alle starten</button>
+        <button type="button" id="btn-launch-all" class="btn btn-gold" hidden aria-describedby="launch-all-reason">Alle starten</button>
       </div>
     </div>
+    <p id="launch-all-reason" class="launch-reason small" role="status" hidden></p>
     <div id="lobby-banner" class="callout" role="status" hidden></div>
     <div id="launch-error" class="callout callout-error" role="alert" hidden></div>
     <div id="data-warning" class="callout callout-warning" hidden></div>
 
     <div class="grid-lobby">
       <div class="stack">
+        <section class="card mod-card" aria-labelledby="h-mod">
+          <div class="card-head">
+            <h2 id="h-mod">Spielversion / Mod</h2>
+            <span id="mod-badge" class="badge" hidden></span>
+          </div>
+          <div id="mod-current" class="mod-current"></div>
+          <form id="mod-host" class="mod-host" novalidate autocomplete="off" hidden>
+            <div class="mod-host-fields">
+              <div class="field">
+                <label for="mod-select">Spielversion für alle</label>
+                <select id="mod-select" aria-describedby="mod-select-hint"></select>
+              </div>
+              <div class="field">
+                <label for="mod-lang">Sprachvariante</label>
+                <select id="mod-lang" aria-describedby="mod-lang-hint"></select>
+              </div>
+            </div>
+            <p id="mod-select-hint" class="hint"></p>
+            <p id="mod-lang-hint" class="hint">Alle Spieler brauchen dieselben Dateien – auch dieselbe Sprachvariante.</p>
+            <div class="actions">
+              <button type="submit" id="btn-mod-apply" class="btn btn-small btn-primary">Für alle festlegen</button>
+              <button type="button" id="btn-mod-reload" class="btn btn-small">Bibliothek neu einlesen</button>
+            </div>
+          </form>
+          <div id="mod-local" class="mod-local" role="status"></div>
+          <progress id="mod-progress" max="100" value="0" hidden></progress>
+          <div id="mod-actions" class="actions" hidden>
+            <button type="button" id="btn-mod-retry" class="btn btn-small">Erneut prüfen</button>
+            <button type="button" id="btn-mod-cancel" class="btn btn-small">Abbrechen</button>
+          </div>
+          <details id="mod-import" class="mod-import">
+            <summary>Dateien aus Ordner importieren</summary>
+            <form id="mod-import-form" novalidate autocomplete="off">
+              <div class="field">
+                <label for="mod-import-path">Ordner</label>
+                <input id="mod-import-path" type="text" spellcheck="false" dir="ltr" placeholder="z. B. D:\Sicherung\BFME1" aria-describedby="mod-import-path-hint mod-import-path-err">
+                <p id="mod-import-path-hint" class="hint">Beacon sucht dort fehlende Dateien anhand ihrer Prüfsumme (MD5) und kopiert passende in seinen eigenen Speicher. Der Ordner selbst wird nicht verändert. Programmdateien (z. B. lotrbfme.exe) übernimmt Beacon nur aus deiner BFME-Installation.</p>
+                <p id="mod-import-path-err" class="field-error" hidden></p>
+              </div>
+              <div class="actions">
+                <button type="submit" id="btn-mod-import" class="btn btn-small">Importieren</button>
+              </div>
+            </form>
+          </details>
+        </section>
+
         <section class="card" aria-labelledby="h-players">
           <h2 id="h-players">Spieler <span id="player-count" class="muted"></span></h2>
           <div class="table-wrap">
@@ -119,6 +166,7 @@
                 <tr>
                   <th scope="col">Name</th>
                   <th scope="col">Ping</th>
+                  <th scope="col">Spielversion</th>
                   <th scope="col">Spieldaten</th>
                   <th scope="col">Status</th>
                   <th scope="col"><span class="sr-only">Aktionen</span></th>
@@ -216,6 +264,27 @@
         </div>
       </fieldset>
 
+      <fieldset>
+        <legend>Mods und Spielversionen</legend>
+        <div class="field">
+          <label for="s-modsdir">Speicherort</label>
+          <input id="s-modsdir" type="text" spellcheck="false" dir="ltr" placeholder="leer lassen = im Beacon-Datenordner" aria-describedby="s-modsdir-hint s-modsdir-err">
+          <p id="s-modsdir-hint" class="hint">Hier legt Beacon geprüfte Dateien und die Instanzordner der Spielversionen ab (beides im selben Ordner, damit harte Verknüpfungen statt Kopien möglich sind). Bereits gespeicherte Dateien werden nicht verschoben.</p>
+          <p id="s-modsdir-err" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <label for="s-importdirs">Zusätzliche Ordner für den Import</label>
+          <textarea id="s-importdirs" rows="3" spellcheck="false" dir="ltr" placeholder="ein Ordner pro Zeile" aria-describedby="s-importdirs-hint s-importdirs-err"></textarea>
+          <p id="s-importdirs-hint" class="hint">Beacon sucht fehlende Dateien zuerst im Cache des BFME-Workshop-Launchers und in deinem Spielordner, dann hier. Nur lesend.</p>
+          <p id="s-importdirs-err" class="field-error" hidden></p>
+        </div>
+        <div class="check">
+          <input id="s-workshop" type="checkbox" disabled aria-describedby="s-workshop-hint">
+          <label for="s-workshop">Fehlende Dateien aus dem BFME Workshop herunterladen</label>
+          <p id="s-workshop-hint" class="hint">Wartet auf die Zustimmung des BFME-Foundation-Teams.</p>
+        </div>
+      </fieldset>
+
       <details class="advanced">
         <summary>Erweitert</summary>
         <fieldset>
@@ -245,6 +314,17 @@
       </div>
       <div id="settings-error" class="callout callout-error" role="alert" hidden></div>
     </form>
+
+    <section class="card" aria-labelledby="h-modstore">
+      <h2 id="h-modstore">Speicher für Spielversionen</h2>
+      <dl id="mod-store" class="kv"></dl>
+      <ul id="mod-instances" class="mod-instances"></ul>
+      <p id="mod-instances-empty" class="muted small">Noch keine Instanzordner.</p>
+      <div class="actions">
+        <button type="button" id="btn-mod-cleanup" class="btn">Aufräumen</button>
+      </div>
+      <p class="hint">Entfernt Instanzordner, die die Lobby gerade nicht verwendet, und gespeicherte Dateien, die keine verbleibende Instanz braucht. Deine BFME-Installation und die Ordner des BFME-Workshop-Launchers bleiben unberührt.</p>
+    </section>
 
     <section class="card" aria-labelledby="h-lanname">
       <h2 id="h-lanname">BFME-LAN-Name</h2>
