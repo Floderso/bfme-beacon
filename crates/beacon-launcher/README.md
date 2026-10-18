@@ -2,9 +2,10 @@
 
 The player-side program of BFME Beacon (contract: `docs/dev/architecture.md` §1,
 §4.3, §5–§8): control client, **agent** (hook ↔ relay data plane), game detection,
-hook install, Network.ini name, map sync, game-data fingerprint, game start, a
-headless CLI and the **web UI** (German, in the default browser) on top of the
-internal API below.
+hook install, Network.ini name, map sync, game-data fingerprint, game start,
+**lobby game configurations** (BFME Workshop packages in Beacon instance folders,
+`docs/dev/mods.md`), a headless CLI and the **web UI** (German, in the default
+browser) on top of the internal API below.
 
 ```sh
 # toolchains and linkers: docs/dev/building.md
@@ -18,9 +19,12 @@ cargo hook                                            # the wsock32.dll that shi
 Ship `Beacon.exe` together with `wsock32.dll` (`cargo hook` output) in one folder.
 Dependencies: `beacon-proto` (its `snow`/`blake3` re-exports), `tokio`, `serde`,
 `serde_json`, `tracing(-subscriber)`, `getrandom`, `windows-sys`, `axum` (same
-features as beacon-server) and `futures-core` (the `Stream` trait for the event
-stream) – all already in the workspace graph, none with a build script of its own;
-`beacon-server` only as a dev-dependency.
+features as beacon-server), `futures-core` (the `Stream` trait for the event
+stream) and `md-5` (RustCrypto MD5, pure Rust; its `digest` dependency was already
+in the graph) – none with a build script of its own; `beacon-server` only as a
+dev-dependency. HTTP(S) for the BFME Workshop uses **WinHTTP** through
+`windows-sys` (`sys/winhttp.rs`): the system's TLS stack, certificate store and
+proxy, so no TLS crate (`ring`, OpenSSL) enters the graph.
 
 ## Command line
 
@@ -32,6 +36,9 @@ Beacon.exe connect --server HOST[:PORT] --name NAME (--password-stdin | --rememb
 Beacon.exe detect [OPTIONS]                JSON: game folder, exe identity, user folders, hook status (exit 1 = not found)
 Beacon.exe fingerprint [OPTIONS]           JSON: digest + file list (uses the hash cache)
 Beacon.exe restore-name [OPTIONS]          restore BFME's original LAN name (Network.ini UserName)
+Beacon.exe mods list [OPTIONS]             JSON: configurations from the BFME Workshop (AIO) library
+Beacon.exe mods prepare GUID@VERSION [--language XX] [--import DIR]... [--mods-dir DIR] [OPTIONS]
+                                           build that configuration's instance from local files (JSON)
 Beacon.exe stop [OPTIONS]                  ask the running instance to quit gracefully, wait until it has
 Beacon.exe version | help
 OPTIONS: --instance N (1..=8)  --multi  --data-dir DIR  --game-dir DIR  --hook-dll PATH  -v/--verbose
@@ -61,12 +68,15 @@ OPTIONS: --instance N (1..=8)  --multi  --data-dir DIR  --game-dir DIR  --hook-d
 
 | Path | Content |
 |---|---|
-| `config.json` | player name, last server, servers (`address`, `pin` = server name + salt + KDF, `remembered_psk` = DPAPI blob), `game_dir`, `launch {windowed, xres, yres, noshellmap}`, `name_sync` (true), `auto_launch_on_host_start` (true), `redundancy {lobby, game, other}` overrides. Written atomically; a damaged file is moved aside. |
+| `config.json` | player name, last server, servers (`address`, `pin` = server name + salt + KDF, `remembered_psk` = DPAPI blob), `game_dir`, `launch {windowed, xres, yres, noshellmap}`, `name_sync` (true), `auto_launch_on_host_start` (true), `redundancy {lobby, game, other}` overrides, `mods {dir, import_dirs, workshop_downloads}`. Written atomically; a damaged file is moved aside. |
 | `cache.json` | fingerprint hash cache `(path, size, mtime) → BLAKE3` |
 | `name-backup.json` | original Network.ini `UserName` per file (for `restore-name`) |
 | `running.json` | pid, port, token of the running instance (handover; removed on exit) |
 | `logs\beacon-<UTC>-<pid>.log`, `logs\hook-<UTC>-<pid>.log` | launcher and hook logs; the newest 10 of each kind are kept, a launcher log rolls over after 16 MiB |
 | `userdata\` | test mode: the instance's `BEACON_USERDIR` (BFME appends its leaf folder) |
+| `mods\store\<md5>`, `mods\store\index.json` | game configurations: MD5-verified, read-only files (index: size, BLAKE3); the folder `mods` is the `mods.dir` setting's default |
+| `mods\instances\<id>\game\`, `…\mod\`, `…\instance.json` | instance folders of configurations (hardlinks into the store, or copies), the record written last |
+| `mods\downloads\<md5>.part`, `mods\workshop\manifests\` | unfinished workshop downloads, fetched workshop manifests (only with workshop downloads, off in this build) |
 
 The maps folder gets `beacon-maps.json` (files Beacon installed).
 
@@ -144,6 +154,24 @@ anything else → conflict (never touched). Names/paths checked with
 per file; chunks (≤ 32 KiB, paced below the server's limit) go to a temporary file,
 size + BLAKE3 are verified, then it is renamed into place and recorded.
 
+**Game configurations** (`mods`, `docs/dev/mods.md`): the host's catalog comes
+from the AIO library `%APPDATA%\BFME Workshop\Library` (read-only) and is
+resolved with the AIO's rules (enhancement, package, type-0 dependencies, base
+game; first destination wins; language filter) into a `GameConfig` with the
+expected file set. On `game_config` every launcher prepares it on a background
+thread (cancelled on a change): reuse a complete instance; free-space check;
+import missing files into the content-addressed store from the AIO caches
+(`<md5>.pfcache`), the game folder and user-added folders (same path, then by
+size/name; every candidate MD5-verified; sources only read; executables only
+from the user's installation at the same path); workshop downloads if enabled
+(**unavailable** in this build: `mods::WORKSHOP_DOWNLOADS_AVAILABLE = false`;
+tested against a fake server: manifest once per `guid:version`, ≤ 2 parallel,
+Range resume, back-off, size limits, MD5, honest User-Agent); then the instance
+folder as NTFS hardlinks into the store (copies where a probe link fails).
+Readiness goes to the server in `status.config`. With a configuration BFME
+starts from `instances\<id>\game` (hook DLL installed there, `-mod` for type-1
+packages) and the fingerprint covers that folder.
+
 **Single instance** (`instance`): named mutex per data folder + `running.json`; a
 second start hands over to the running one (`Activate` → `Change::Activate`: the
 running default-mode instance opens the browser with its UI URL again; `Quit` =
@@ -180,6 +208,10 @@ State changes are published as [`Change`] values (`connection`, `lobby`, `chat`,
 | `restore_user_name()` | restores the backed-up Network.ini `UserName` |
 | `activate()` / `quit()` / `request_quit()` / `quit_requested()` | handover, shutdown (the game keeps running), wait for shutdown |
 | `agent_endpoint()` / `agent_stats()` | `(port, token)` for the hook, live counters |
+| `set_game_config(key: Option<String>, language: Option<String>)` | host only: a catalog key `guid@version` (`None` = vanilla) and language variant → `set_game_config`; `NotHost`, `Unsupported` (server without `game_config`), `InvalidInput` (unknown key, unresolvable, too large) |
+| `mods_retry()` / `mods_cancel()` / `mods_reload()` | prepare again / cancel / read the AIO library again |
+| `mods_import_folder(&str)` | adds an absolute folder to `mods.import_dirs` and prepares again |
+| `mods_cleanup()` | removes unused instance folders and store files → `CleanupReport {instances, files, bytes}` |
 
 Errors are `CommandError { kind: CommandErrorKind, message }` (serde, snake_case
 kinds). Connection problems appear in `state.connection`:
@@ -194,7 +226,7 @@ kinds). Connection problems appear in `state.connection`:
 ```
 
 `AppState` fields: `version`, `instance`, `test_mode`, `data_dir`, `connection`,
-`server {address, name, motd, vip, you_are_host, relay_addr, newly_pinned}`,
+`server {address, name, motd, vip, you_are_host, relay_addr, newly_pinned, features}`,
 `players` (beacon-proto `Player`), `chat` (last 200 `{from, text, ts}`; `from` = ""
 for server notices), `maps {maps_dir, listing_received, maps [{name, total_size,
 files, state: installed|missing|conflict|invalid|downloading|failed, problem}],
@@ -206,7 +238,13 @@ sync {running, current, bytes_done, bytes_total, downloaded, last_error}}`, `gam
 (`AgentStats`: `local_port`, `session_active`, `vip`, `registrations`, `rtt_ms`,
 `loss_pct`, packet counters), `fingerprint` (`{state: unavailable|computing|ready|failed, …}`),
 `peer_files`, `settings` (config without secrets: servers with `pinned_name`,
-`pinned_at_ms`, `remembered`), `notices` (last 50 `{id, ts_ms, level, text}`).
+`pinned_at_ms`, `remembered`), `notices` (last 50 `{id, ts_ms, level, text}`),
+`mods` (`lobby` = the configuration with attribution data and `set_by`, `local`
+= `{state: vanilla|preparing|ready|missing|error, …}` with progress, instance
+folder, link mode, missing files and notes, `catalog`, `catalog_loaded`,
+`catalog_problems`, `game_language`, `storage {root, store_files, store_bytes,
+instances, free_bytes, link_mode, link_note}`, `settings {dir, dir_is_default,
+import_dirs, workshop_downloads, workshop_available}`).
 
 ## Web UI
 
@@ -243,7 +281,11 @@ input rule such as `name_too_long`, `invalid_address`, `resolution_range`):
 | `POST /api/disconnect`, `/api/launch`, `/api/launch_all`, `/api/maps/sync`, `/api/quit` | `{}` | |
 | `POST /api/chat` / `/api/ready` / `/api/kick` | `{text}` / `{ready}` / `{name}` | |
 | `POST /api/fingerprint` | `{name}` | that player's file list → `peer_files` |
-| `POST /api/settings` | `SettingsPatch` (`player_name`, `game_dir`, `launch {windowed, xres, yres, noshellmap}`, `name_sync`, `auto_launch_on_host_start`, `redundancy {lobby, game, other}`) | |
+| `POST /api/settings` | `SettingsPatch` (`player_name`, `game_dir`, `launch {windowed, xres, yres, noshellmap}`, `name_sync`, `auto_launch_on_host_start`, `redundancy {lobby, game, other}`, `mods_dir` (`""` = default), `import_dirs`, `workshop_downloads` (refused while unavailable)) | |
+| `POST /api/mods/select` | `{key, language?}` | host: `key` = `guid@version` or `null` (vanilla) |
+| `POST /api/mods/retry`, `/api/mods/cancel`, `/api/mods/reload` | `{}` | |
+| `POST /api/mods/import` | `{path}` | absolute folder to search |
+| `POST /api/mods/cleanup` | `{}` | `{removed: {instances, files, bytes}}` |
 | `POST /api/pin/reset`, `/api/password/forget` | `{server}` | `{removed}` |
 | `POST /api/name/restore` | `{}` | `{restored}`: BFME's original LAN name |
 | `POST /api/logs/open` | `{}` | shows the log folder in Explorer |
@@ -259,14 +301,23 @@ ungültig", the end of Beacon "Beacon wurde beendet". Views:
   Beacon checks it), password, "Passwort merken", recently used servers (pinned
   name, "Passwort vergessen", "Identität zurücksetzen"), connection status with
   reconnect countdown; a changed server identity is explained with a reset button.
-* **Lobby** – server name, MOTD, own vIP; players with host crown, ping + loss,
+* **Lobby** – a "Spielversion / Mod" card: the lobby's configuration with
+  attribution ("Aus dem BFME Workshop (BFME Foundation Project)", link to
+  bfmeladder.com), for the host a selector (vanilla + catalog) with the language
+  variant, the own preparation with progress, missing files and "Erneut prüfen",
+  "Dateien aus Ordner importieren"; a "Spielversion" column per player; "Alle
+  starten" disabled with the reason while players are not ready.
+  Server name, MOTD, own vIP; players with host crown, ping + loss,
   game data vs. the host (`✓ wie Host` / `✗ weicht ab` with the differing files
   on request, own data "wird geprüft …" while fingerprinting), ready, "im Spiel",
   host-only Kick; chat with timestamps; map pool with state and sync progress;
   buttons Bereit, "BFME starten", host-only "Alle starten".
 * **Einstellungen** – detected game folder and override, Fenstermodus +
   Auflösung, Shellmap aus, Name ins Spiel übernehmen, automatisch starten wenn der
-  Host startet, Erweitert: Redundanz; restore the original LAN name.
+  Host startet, Mods und Spielversionen (store location, import folders, the
+  workshop toggle – disabled: "Wartet auf die Zustimmung des
+  BFME-Foundation-Teams"), Erweitert: Redundanz; storage for game versions (disk
+  usage, instance folders, "Aufräumen"); restore the original LAN name.
 * **Diagnose** – game detection and exe identity, hook state/version (and
   "Firewall-Abfrage: übersprungen": the hook answers BFME's XP firewall query
   itself), game process, agent RTT/loss/packet counters/registered ports,
@@ -296,6 +347,15 @@ again after an Explorer restart and removed on exit.
   `SEND`/`DELIVER` with the correct source exactly once and no echo, map sync of a
   test map, wrong password, remembered key, and a changed salt on the same address
   refused by the pin until it is reset.
+* `tests/mods.rs` (Windows): WinHTTP against a local fake HTTP server (never the
+  real workshop): manifest cache and User-Agent, Range resume, corrupt
+  downloads, back-off and 4xx, at most two parallel downloads, size limits, URL
+  checks, cancellation; an in-process lobby where two launchers agree on a
+  configuration from a synthetic AIO library, prepare it (import, download) and
+  report readiness, `launch_all` waits for both, back to vanilla and clean-up,
+  installations and library unchanged. Unit tests of `mods`: store, instances
+  (hardlinks + copy fallback), manifests, AIO resolution, import by MD5,
+  preparation.
 * `tests/web.rs`: `WebServer` over real TCP with a raw HTTP/1.1 client: missing,
   wrong, truncated and upper-case tokens, foreign `Host` (incl. absolute-form
   targets, HTTP/1.0 without `Host`), foreign/`null` `Origin`, cross-site

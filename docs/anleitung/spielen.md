@@ -8,7 +8,8 @@ klappt, schau in die [Hilfe bei Problemen](fehlerbehebung.md).
 * Einen PC mit **Windows 10 oder 11** (64-Bit).
 * **„Die Schlacht um Mittelerde“ (BFME1)**, installiert über den
   **BFME All-in-One-Launcher**, mit **Patch 1.06**. Alle Mitspieler brauchen
-  genau denselben Stand. Mods nur, wenn alle dieselben haben.
+  genau denselben Stand. Andere Patches und Mods wählt der Host in Beacon aus
+  (siehe [Mods spielen](#mods-spielen)).
 * Vom Betreiber des Servers: die **Server-Adresse** (zum Beispiel
   `mein-server.de` oder `203.0.113.5:28086`) und das **Passwort**.
 
@@ -89,6 +90,64 @@ Wichtig:
 * **Lass Beacon während des Spiels laufen.** Beendest du Beacon, verlierst du die
   Verbindung zum Spiel.
 
+## Mods spielen
+
+Der Host kann in der Lobby eine andere **Spielversion** für alle festlegen, zum
+Beispiel „Patch 2.22 7.0.5“ oder „Legends of the 3rd Age 0.5.2“ (mit Patch 1.06).
+Beacon bereitet diese Version dann bei jedem Spieler vor und startet BFME aus
+einem eigenen **Instanzordner**. Deine BFME-Installation und der
+BFME-Workshop-Launcher (All-in-One-Launcher) bleiben dabei unverändert. Ohne
+Auswahl gilt **Vanilla**: Jeder spielt mit seiner Installation, wie bisher.
+
+**Als Host:**
+
+1. In der Lobby, Karte **„Spielversion / Mod“**: Spielversion auswählen. Die
+   Liste kommt aus der Bibliothek des BFME-Workshop-Launchers. Was du dort
+   einmal installiert hast, steht hier zur Auswahl.
+2. **Sprachvariante** wählen. Vorgeschlagen ist die Sprache deines Spiels. Alle
+   Spieler brauchen dieselben Dateien, auch dieselbe Sprachvariante.
+3. **„Für alle festlegen“** klicken.
+4. In der Spielerliste siehst du in der Spalte **„Spielversion“**, wer schon
+   bereit ist. **„Alle starten“** geht erst, wenn alle „✓ bereit“ sind.
+   Darunter steht, auf wen ihr noch wartet.
+
+**Als Mitspieler** musst du nichts tun. Beacon sucht die nötigen Dateien:
+
+* im Zwischenspeicher des BFME-Workshop-Launchers,
+* in deinem BFME-Ordner,
+* in Ordnern, die du selbst angibst.
+
+Jede Datei prüft Beacon anhand ihrer Prüfsumme (MD5) und kopiert sie in seinen
+eigenen Speicher. Das dauert beim ersten Mal einige Minuten. Danach ist die
+Version sofort bereit.
+
+**Wenn Dateien fehlen**, zeigt die Karte „Spielversion / Mod“, welche. Dann:
+
+* Installiere diese Version einmal im BFME-Workshop-Launcher und klicke danach
+  in Beacon auf **„Erneut prüfen“**. Du kannst den Workshop-Launcher danach
+  wieder auf deine gewohnte Version stellen.
+* Oder: **„Dateien aus Ordner importieren“** und einen Ordner angeben, in dem die
+  Dateien liegen (zum Beispiel eine Sicherung deines BFME-Ordners). Beacon liest
+  dort nur.
+
+Der automatische Download aus dem BFME Workshop ist eingebaut, aber noch
+abgeschaltet: Er **wartet auf die Zustimmung des BFME-Foundation-Teams**.
+
+Gut zu wissen:
+
+* **Platz:** Beacon speichert jede Datei nur einmal (in
+  `%APPDATA%\Beacon\mods`, der Ort lässt sich unter „Einstellungen“ ändern). Die
+  Instanzordner verweisen mit harten Verknüpfungen darauf und brauchen keinen
+  zusätzlichen Platz. Wo das nicht geht (zum Beispiel auf FAT32-Laufwerken),
+  kopiert Beacon die Dateien und sagt dir das.
+* **Aufräumen:** „Einstellungen“ → „Speicher für Spielversionen“ →
+  **„Aufräumen“** entfernt Instanzen und Dateien, die gerade nicht gebraucht
+  werden.
+* Startet der Server neu, gilt wieder Vanilla. Der Host wählt die Version dann
+  einfach noch einmal.
+* Wechselst du im BFME-Workshop-Launcher die Version, während ein Beacon-Spiel
+  läuft, beendet der Launcher BFME. Wechsle also erst nach dem Spiel.
+
 ## Einstellungen
 
 Unter **„Einstellungen“** kannst du unter anderem festlegen:
@@ -98,6 +157,7 @@ Unter **„Einstellungen“** kannst du unter anderem festlegen:
 * „Name ins Spiel übernehmen“ (siehe unten)
 * „Automatisch starten, wenn der Host startet“
 * „Eigener Spielordner“, falls Beacon BFME nicht selbst findet
+* „Mods und Spielversionen“: Speicherort und zusätzliche Ordner für den Import
 
 ## Was Beacon an deinem PC ändert
 
@@ -115,6 +175,9 @@ Netzwerkverkehr von BFME an Beacon weiter.
 * Die `lotrbfme.exe` verändert Beacon nie.
 * Liegt dort schon eine fremde `wsock32.dll` (von einem anderen Tool), überschreibt
   Beacon sie nicht.
+
+Spielt ihr eine vom Host gewählte Spielversion, liegt die `wsock32.dll` im
+Instanzordner dieser Version, nicht in deinem BFME-Ordner.
 
 **Entfernen:** BFME und Beacon beenden, dann `wsock32.dll` im BFME-Ordner löschen.
 Lösche nur diese eine Datei im BFME-Ordner. Die `wsock32.dll` von Windows liegt
@@ -139,7 +202,9 @@ Ordner. Deine eigenen Karten überschreibt Beacon nie.
 ### Der Datenordner `%APPDATA%\Beacon`
 
 Hier speichert Beacon deine Einstellungen (`config.json`), die gemerkten Server und
-Schlüssel, den gesicherten LAN-Namen und die Logs (`logs\`). Du öffnest ihn mit
+Schlüssel, den gesicherten LAN-Namen, die Logs (`logs\`) und im Unterordner
+`mods\` die Dateien und Instanzordner der Spielversionen (siehe
+[Mods spielen](#mods-spielen)). Du öffnest ihn mit
 `Windows-Taste + R`, dann `%APPDATA%\Beacon` eingeben und Enter drücken.
 
 ## Beacon aktualisieren

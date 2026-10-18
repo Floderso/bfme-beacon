@@ -4,6 +4,25 @@ Alle wichtigen Änderungen an BFME Beacon. Das Format folgt
 [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), die Versionsnummern
 folgen [Semantic Versioning](https://semver.org/lang/de/).
 
+## [Unveröffentlicht]
+
+### Neu
+
+* **Spielversion / Mod für die ganze Lobby:** Der Host wählt eine Version aus der
+  Bibliothek des BFME-Workshop-Launchers (zum Beispiel Patch 2.22 oder Legends of
+  the 3rd Age mit Patch 1.06) und eine Sprachvariante. Jedes Beacon bereitet
+  genau diese Dateien vor (aus dem Zwischenspeicher des Workshop-Launchers, dem
+  BFME-Ordner oder selbst gewählten Ordnern, jede Datei per MD5 geprüft) und
+  startet BFME aus einem eigenen Instanzordner mit harten Verknüpfungen. Die
+  eigene BFME-Installation bleibt unverändert; ohne Auswahl gilt Vanilla wie
+  bisher. Die Lobby zeigt pro Spieler, ob er bereit ist; „Alle starten“ wartet,
+  bis alle bereit sind. Speicherort, Import-Ordner und „Aufräumen“ in den
+  Einstellungen; `Beacon.exe mods list|prepare` für die Kommandozeile.
+* **beacon-server:** nimmt die Spielversion des Hosts an, prüft sie, verteilt
+  sie an alle und lässt „Alle starten“ erst zu, wenn alle bereit sind.
+* Download fehlender Dateien aus dem BFME Workshop ist eingebaut, aber
+  abgeschaltet, bis das BFME-Foundation-Team zustimmt.
+
 ## [0.1.0] - 2026-10-18
 
 Erste öffentliche Version.

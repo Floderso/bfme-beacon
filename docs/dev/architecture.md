@@ -207,8 +207,10 @@ Nonce = direction (1 = agent→server, 2 = server→agent) ‖ 3 zero bytes ‖ 
 5. Liveness: client `ping` every 5 s; server drops idle sessions after 30 s.
 
 Lobby: players `{name, vip, rtt_ms, loss_pct, fingerprint, ready, in_game,
-is_host}`, chat, MOTD, map pool, host actions (`launch_all`, `kick`). The first
-player (or `admin_names` from config) is host.
+is_host, config}`, chat, MOTD, map pool, host actions (`launch_all`, `kick`,
+`set_game_config`). The first player (or `admin_names` from config) is host.
+Game configurations (BFME Workshop packages in Beacon instance folders,
+per-player readiness, `launch_all` gated on it): [`mods.md`](mods.md).
 
 ## 8. Game data fingerprint, CD key, names, maps
 
