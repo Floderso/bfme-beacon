@@ -335,4 +335,10 @@ hook harness exe was blocked when rebuilt here, the identical harness from
 * Map/file writes in the map sync are small blocking writes on a runtime thread.
 * A vIP change after a server restart without `data_dir` cannot reach a running game
   (BFME caches its IP at start); the server persists vIPs by default.
+* A server that vanishes without closing the connection (host power loss, network
+  cut) is noticed by the control client's 30 s idle timeout only (a restarted
+  server process answers the next ping with a reset within 5 s).
+* A stopping server is recognised by the text of its `kick` ("Der Server wird
+  beendet.", `control::SERVER_STOPPING_REASON`); `tests/app.rs` fails if the
+  server's text changes.
 * No in-memory game patches (`BEACON_PATCHES`) yet (architecture §10).
