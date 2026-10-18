@@ -1,6 +1,20 @@
+# Text files are stored and checked out with LF line endings.
+# (Release packaging converts the Windows text files to CRLF.)
 * text=auto eol=lf
+
+# Binary files
 *.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.zip binary
 *.dll binary
 *.exe binary
 *.big binary
 *.map binary
+*.tga binary
+
+# Generated files (collapsed in diffs, excluded from language statistics)
+Cargo.lock linguist-generated=true
+crates/beacon-hook/wsock32.def linguist-generated=true
+patches/openbfme-bundle.json linguist-generated=true

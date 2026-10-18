@@ -1,4 +1,27 @@
+# Build output
 /target
 /dist
+/ctx
+
+# Logs, scratch files, editor and OS clutter
 *.log
 /scratch
+__pycache__/
+*.py[co]
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Binaries and game files never belong in the repository (see NOTICE)
+*.exe
+*.dll
+*.big
+*.w3d
+*.csf
+*.map
+*.tga
+*.zip
