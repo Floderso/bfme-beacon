@@ -1,9 +1,9 @@
-# BFME Beacon – Server-Konfiguration für den Homelab-Container
+# BFME Beacon – Server-Konfiguration für den Docker-Container (Beispiel)
 #
-# Auf dem Server: /srv/docker/beacon/config.toml
+# Auf dem Host:   <Beacon-Ordner>/config.toml (z. B. /opt/beacon/config.toml)
 # Im Container:   /config.toml (read-only eingebunden, siehe compose.yaml)
 #
-# Passwort setzen: siehe README.md, Abschnitt „Passwort setzen“. Dabei werden
+# Passwort setzen: siehe docs/anleitung/server.md, „Passwort setzen“. Dabei werden
 # `salt` und `psk` unten eingetragen – das Passwort selbst wird nie gespeichert.
 # Diese Datei trotzdem privat halten: der Schlüssel öffnet den Server wie das
 # Passwort. Nach Änderungen: docker compose restart
@@ -35,7 +35,7 @@ salt = ""
 psk = ""
 
 # Kartenordner im Container (read-only): /maps/<Kartenname>/<Dateien>.
-# Auf dem Host: /srv/docker/beacon/maps
+# Auf dem Host: <Beacon-Ordner>/maps
 maps_dir = "/maps"
 
 # Kartenordner alle N Sekunden neu einlesen (0 = nur beim Start und bei SIGHUP:
@@ -43,7 +43,8 @@ maps_dir = "/maps"
 map_rescan_secs = 60
 
 # Beschreibbarer Ordner für dauerhafte Daten (feste virtuelle IP pro Spielername).
-# Auf dem Host: /srv/docker/beacon/data (Besitzer 1000:1001).
+# Auf dem Host: <Beacon-Ordner>/data (muss dem Container-Benutzer gehören,
+# siehe `user:` in compose.yaml).
 data_dir = "/data"
 
 # Status-Endpunkt (GET /health, GET /status als JSON). Im Container auf allen
@@ -87,7 +88,7 @@ kick_ban_secs = 60           # gekickte Spieler können so lange nicht wieder be
 
 # Benachrichtigungen, z. B. per ntfy aufs Handy (optional): HTTP-POST mit dem
 # Text als Inhalt und dem Header "Title". Nur http:// (kein TLS) – also die
-# eigene ntfy-Instanz im Heimnetz/Docker-Netz, siehe README.md.
+# eigene ntfy-Instanz im Heimnetz/Docker-Netz, siehe docs/anleitung/server.md.
 # Ereignisse: start, stop, join, leave, launch, kick.
 #[webhook]
 #url = "http://host.docker.internal:8080/bfme"

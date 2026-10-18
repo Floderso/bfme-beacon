@@ -1,8 +1,9 @@
 # BFME Beacon — architecture and protocol (engineering contract)
 
-Status: v0.3 (2026-10-17). Facts about BFME come from `D:/BFME-RE/specs/*.md`
-(Open-BFME sources + retail disassembly, cited there). If this document and a spec
-disagree, the spec's cited evidence wins; fix this document.
+Status: v0.3 (2026-10-17). Facts about BFME come from the project's reverse-
+engineering specs ("spec 01" … "spec 08"; not part of this repository), which cite
+their evidence: Open-BFME sources and the retail disassembly. If this document and
+a spec disagree, the spec's cited evidence wins; fix this document.
 
 ## 1. Goals and non-goals
 

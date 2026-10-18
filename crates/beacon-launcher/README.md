@@ -7,8 +7,7 @@ headless CLI and the **web UI** (German, in the default browser) on top of the
 internal API below.
 
 ```sh
-. /d/BFME-RE/env.sh
-export CARGO_TARGET_DIR=/d/BFME-RE/build/target-launcher
+# toolchains and linkers: docs/dev/building.md
 export CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=false   # see "Smart App Control" below
 cargo build -p beacon-launcher [--release]            # -> $CARGO_TARGET_DIR/{debug,release}/Beacon.exe
 cargo test -p beacon-launcher                         # unit + tests/app.rs + tests/web.rs

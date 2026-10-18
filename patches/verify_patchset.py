@@ -18,7 +18,9 @@ Two modes:
           detour at each site jumps into placed cave, and that re-applying a
           feature now FAILS the original-bytes gate (so a double-apply is caught).
 
-Paths are the fixed workspace locations; run from anywhere. Exit code 0 on pass.
+Inputs (not part of this repository): the vanilla workshop-1.03 lotrbfme.exe and
+Open-BFME's mods/dist/lotrbfme.exe. Pass --openbfme <Open-BFME-1 checkout> (or set
+OPENBFME_DIR), or name the files with --base/--dist. Exit code 0 on pass.
 
 License of the described artifact: GPL-3.0 (Open-BFME,
 https://github.com/Open-BFME/Open-BFME-1).
@@ -35,8 +37,11 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 JSON = os.path.join(HERE, 'openbfme-bundle.json')
-BASE = r'D:/BFME-RE/Open-BFME-1/inputs/baselines/bfme1/workshop-vanilla-1.03/files/lotrbfme.exe'
-DIST = r'D:/BFME-RE/Open-BFME-1/mods/dist/lotrbfme.exe'
+# Relative to an Open-BFME-1 checkout; overridden by --base/--dist (see main()).
+BASE_REL = os.path.join('inputs', 'baselines', 'bfme1', 'workshop-vanilla-1.03', 'files', 'lotrbfme.exe')
+DIST_REL = os.path.join('mods', 'dist', 'lotrbfme.exe')
+BASE = None
+DIST = None
 
 
 def sha256(b):
@@ -217,7 +222,17 @@ def main():
     ap.add_argument('mode', nargs='?', default='file', choices=['file', 'memory', 'both'])
     ap.add_argument('--features', default=None,
                     help='comma-separated feature ids for memory mode (default: all 7)')
+    ap.add_argument('--openbfme', default=os.environ.get('OPENBFME_DIR'),
+                    help='Open-BFME-1 checkout (default: $OPENBFME_DIR)')
+    ap.add_argument('--base', help='vanilla workshop-1.03 lotrbfme.exe')
+    ap.add_argument('--dist', help="Open-BFME's mods/dist/lotrbfme.exe (file mode)")
     a = ap.parse_args()
+    global BASE, DIST
+    root = a.openbfme
+    BASE = a.base or (root and os.path.join(root, BASE_REL))
+    DIST = a.dist or (root and os.path.join(root, DIST_REL))
+    if not BASE or (a.mode in ('file', 'both') and not DIST):
+        ap.error('pass --openbfme <Open-BFME-1 checkout> (or set OPENBFME_DIR), or --base/--dist')
     ps = load_json()
     assert ps['license'].startswith('GPL-3.0'), 'license field missing'
 

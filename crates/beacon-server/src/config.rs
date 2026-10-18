@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn deploy_example_is_valid() {
-        let text = include_str!("../../../deploy/homelab-beacon/config.toml");
+        let text = include_str!("../../../deploy/docker/config.toml");
         let cfg = Config::from_toml(text).unwrap();
         let s = Config::from_toml(&with_secret(text))
             .unwrap()
@@ -1106,7 +1106,7 @@ mod tests {
 
     // Regression: the replacement got the owner of whoever ran set-password, so
     // `sudo beacon-server set-password` left a root-owned 0600 config that the
-    // container user (1000:1001) cannot read: the server never started again.
+    // container user (e.g. 1000:1000) cannot read: the server never started again.
     // Meaningful when the test runs as root; otherwise it checks that the owner
     // and mode stay the same.
     #[cfg(unix)]

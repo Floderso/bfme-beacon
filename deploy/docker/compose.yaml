@@ -1,0 +1,57 @@
+# BFME Beacon – Lobby- und Relay-Server für „Die Schlacht um Mittelerde“ (BFME1)
+#
+# Beispiel für einen Docker-Host (Linux). Anleitung: docs/anleitung/server.md
+#
+# Inhalt des Ordners (z. B. /opt/beacon):
+#   compose.yaml, config.toml, maps/, data/
+# Starten:             docker compose up -d
+# Logs:                docker compose logs -f beacon
+# Karten neu einlesen: docker compose kill -s HUP beacon
+# Update:              docker compose pull && docker compose up -d
+#
+# Ports: 28086 TCP UND UDP für die Spieler (im Router freigeben oder per VPN),
+#        28087 nur auf 127.0.0.1 des Hosts (Status-JSON und Healthcheck).
+
+services:
+  beacon:
+    image: ghcr.io/floderso/bfme-beacon-server:latest
+    # Statt des fertigen Images selbst bauen: das statische Linux-Binary
+    # „beacon-server“, deploy/Dockerfile und deploy/docker/.dockerignore in
+    # diesen Ordner legen, `image:` oben auskommentieren und dies einkommentieren:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    # image: beacon-server:local
+    container_name: beacon
+    restart: unless-stopped
+    # Benutzer im Container: muss data/ beschreiben und config.toml lesen
+    # können. Bei Bedarf an deinen Benutzer anpassen (`id -u`, `id -g`).
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "0.0.0.0:28086:28086/tcp"
+      - "0.0.0.0:28086:28086/udp"
+      - "127.0.0.1:28087:28087"
+    volumes:
+      - ./config.toml:/config.toml:ro
+      - ./maps:/maps:ro
+      - ./data:/data
+    # Nur nötig, wenn der Webhook (config.toml, [webhook]) einen Dienst
+    # erreichen soll, der auf dem Host selbst läuft:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "/beacon-server", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

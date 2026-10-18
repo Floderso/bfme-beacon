@@ -7,7 +7,7 @@ armed it turns the game's LAN sockets into *virtual sockets* that talk only to t
 Beacon agent on loopback (`BCN1` frames, `beacon_proto::local`).
 
 ```sh
-. /d/BFME-RE/env.sh
+# toolchains and linkers: docs/dev/building.md
 cargo hook            # -> <target>/i686-pc-windows-gnullvm/release-hook/wsock32.dll
 python crates/beacon-hook/tools/check_exports.py <target>/i686-pc-windows-gnullvm/release-hook/wsock32.dll
 cargo hook-harness    # 32-bit harness, 7 scenarios in child processes (crates/beacon-hook-harness)
