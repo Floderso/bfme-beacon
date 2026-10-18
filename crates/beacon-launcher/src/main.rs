@@ -19,6 +19,8 @@ use beacon_launcher::game::hook::HOOK_DLL_NAME;
 use beacon_launcher::instance::{self, Acquire, Action};
 use beacon_launcher::paths::DataDirs;
 use beacon_launcher::state::{Change, ConnectionState};
+use beacon_launcher::sys::TrayCommand;
+use beacon_launcher::web::{WebOptions, WebServer};
 use beacon_launcher::{fingerprint, logging, sys, util};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info, warn};
@@ -254,25 +256,46 @@ async fn acquire(data: &DataDirs, hand_over: bool) -> Result<instance::InstanceL
                         Err(e) => warn!("the running instance did not answer: {e}"),
                     }
                 }
+                gui_error(&format!(
+                    "Beacon läuft bereits (Prozess {pid}), reagiert aber nicht.\n\n\
+                     Beende es über das Beacon-Symbol im Infobereich der Taskleiste oder \
+                     im Task-Manager und starte Beacon dann neu."
+                ));
             }
             error!("Beacon instance {} is already running (pid {pid})", data.instance());
             Err(ExitCode::from(EXIT_FAILURE))
         }
         Err(e) => {
             error!("instance check failed: {e}");
+            if hand_over {
+                gui_error(&format!("Beacon konnte nicht prüfen, ob es bereits läuft:\n{e}"));
+            }
             Err(ExitCode::from(EXIT_FAILURE))
         }
     }
 }
 
+/// A fatal start-up error of the default mode: release builds have no console,
+/// so the player sees it in a message box (debug builds log it only).
+fn gui_error(text: &str) {
+    if cfg!(not(debug_assertions)) {
+        sys::message_box("BFME Beacon", text);
+    }
+}
+
 async fn run_default(c: Common) -> ExitCode {
-    let data = match data_dirs(&c) {
+    let data = match DataDirs::resolve(c.data_dir.as_deref(), c.instance) {
         Ok(d) => d,
-        Err(code) => return code,
+        Err(e) => {
+            eprintln!("{e}");
+            gui_error(&format!("Beacon kann seinen Datenordner nicht verwenden:\n{e}"));
+            return ExitCode::from(EXIT_USAGE);
+        }
     };
     if let Some(log) = logging::init(Some(&data.logs_dir()), true, c.verbose) {
         info!("log file: {}", log.display());
     }
+    // A second start opens the browser of the running instance and ends.
     let lock = match acquire(&data, true).await {
         Ok(l) => l,
         Err(code) => return code,
@@ -281,9 +304,21 @@ async fn run_default(c: Common) -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             error!("{e}");
+            gui_error(&format!("Beacon konnte nicht starten:\n{e}"));
             return ExitCode::from(EXIT_FAILURE);
         }
     };
+    let web = match WebServer::start(app.clone(), WebOptions::default()).await {
+        Ok(w) => w,
+        Err(e) => {
+            error!("cannot start the web UI: {e}");
+            gui_error(&format!("Die Oberfläche von Beacon konnte nicht gestartet werden:\n{e}"));
+            app.quit().await;
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let url = web.url();
+    info!("Beacon {} started; web UI on {}", beacon_launcher::VERSION, web.base_url());
     let handover_app = app.clone();
     let _guard = match lock
         .publish(move |action| match action {
@@ -298,16 +333,67 @@ async fn run_default(c: Common) -> ExitCode {
             None
         }
     };
-    info!(
-        "Beacon {} started; the web UI is not built yet, Beacon runs headless (Ctrl-C to quit)",
-        beacon_launcher::VERSION
-    );
-    tokio::select! {
-        what = shutdown_signal() => info!("{what}: quitting"),
-        () = app.quit_requested() => {}
+    show_ui(&url, c.no_browser);
+    let tray = if c.no_tray { None } else { start_tray(&app) };
+    let mut changes = app.subscribe();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let quit = app.quit_requested();
+    tokio::pin!(quit);
+    loop {
+        tokio::select! {
+            what = &mut shutdown => {
+                info!("{what}: quitting");
+                break;
+            }
+            () = &mut quit => break,
+            change = changes.recv() => match change {
+                Ok(Change::Activate) => show_ui(&url, c.no_browser),
+                Ok(Change::Quit) | Err(RecvError::Closed) => break,
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+            },
+        }
+    }
+    if let Some(tray) = tray {
+        // Removing the icon waits (bounded) for the tray thread.
+        let _ = tokio::task::spawn_blocking(move || drop(tray)).await;
     }
     app.quit().await;
+    web.shutdown().await;
     ExitCode::SUCCESS
+}
+
+/// Opens the UI in the default browser (or only logs the URL with `--no-browser`).
+fn show_ui(url: &str, no_browser: bool) {
+    if no_browser {
+        info!("web UI: {url}");
+        return;
+    }
+    let url = url.to_owned();
+    tokio::task::spawn_blocking(move || match sys::open_url(&url) {
+        Ok(()) => info!("opened the web UI in the browser"),
+        Err(e) => warn!("cannot open the browser ({e}); open {url} manually"),
+    });
+}
+
+/// The notification-area icon: "Öffnen" shows the UI, "Beenden" quits.
+fn start_tray(app: &App) -> Option<sys::Tray> {
+    let rt = tokio::runtime::Handle::current();
+    let app = app.clone();
+    let result = sys::Tray::start("BFME Beacon", move |command| match command {
+        TrayCommand::Open => app.activate(),
+        TrayCommand::Quit => {
+            let app = app.clone();
+            rt.spawn(async move { app.quit().await });
+        }
+    });
+    match result {
+        Ok(tray) => Some(tray),
+        Err(e) => {
+            warn!("no tray icon: {e}");
+            None
+        }
+    }
 }
 
 /// Resolves on Ctrl+C, Ctrl+Break or when the console window is closed (the

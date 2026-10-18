@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>BFME Beacon</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Zum Inhalt springen</a>
+
+<header class="topbar">
+  <div class="brand">
+    <img src="/favicon.svg" alt="" width="32" height="32">
+    <span class="brand-name">BFME Beacon</span>
+  </div>
+  <nav class="tabs" aria-label="Hauptnavigation">
+    <a href="#verbinden" data-view="verbinden">Verbinden</a>
+    <a href="#lobby" data-view="lobby">Lobby <span id="nav-lobby-count" class="count" hidden></span></a>
+    <a href="#einstellungen" data-view="einstellungen">Einstellungen</a>
+    <a href="#diagnose" data-view="diagnose">Diagnose <span id="nav-diag-alert" class="dot" hidden><span class="sr-only">(Hinweis)</span></span></a>
+  </nav>
+  <p id="conn-pill" class="conn-pill" data-state="disconnected" role="status">Nicht verbunden</p>
+</header>
+
+<div id="offline-banner" class="banner" role="alert" hidden>
+  <strong>Keine Verbindung zu Beacon.</strong> <span id="offline-text">Neuer Versuch …</span>
+</div>
+
+<main id="main" tabindex="-1">
+
+  <!-- ======================================================= Verbinden -->
+  <section id="view-verbinden" class="view" aria-labelledby="h-verbinden">
+    <h1 id="h-verbinden">Mit einem Server verbinden</h1>
+    <div class="grid-connect">
+      <form id="connect-form" class="card" novalidate autocomplete="off">
+        <h2>Anmeldung</h2>
+        <div class="field">
+          <label for="f-server">Server-Adresse</label>
+          <input id="f-server" name="server" type="text" required spellcheck="false" autocapitalize="off" dir="ltr" placeholder="z. B. mein-server.de oder 203.0.113.5:28086" aria-describedby="f-server-hint f-server-err" list="f-server-list">
+          <datalist id="f-server-list"></datalist>
+          <p id="f-server-hint" class="hint">Ohne Port wird 28086 verwendet.</p>
+          <p id="f-server-err" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <label for="f-name">Spielername</label>
+          <input id="f-name" name="name" type="text" required maxlength="12" spellcheck="false" autocapitalize="off" dir="auto" aria-describedby="f-name-hint f-name-err">
+          <p id="f-name-hint" class="hint">Höchstens 12 Zeichen: Buchstaben, Ziffern, Leerzeichen und <span dir="ltr">- _ . ! ? # ( ) [ ] { } + * ' &amp; @ ~ ^ = $ %</span></p>
+          <p id="f-name-err" class="field-error" hidden></p>
+        </div>
+        <div class="field">
+          <label for="f-password">Passwort</label>
+          <input id="f-password" name="password" type="password" autocomplete="off" spellcheck="false" aria-describedby="f-password-hint f-password-err">
+          <p id="f-password-hint" class="hint">Das Server-Passwort bekommst du vom Betreiber des Servers.</p>
+          <p id="f-password-err" class="field-error" hidden></p>
+        </div>
+        <div class="check">
+          <input id="f-remember" name="remember" type="checkbox" aria-describedby="f-remember-hint">
+          <label for="f-remember">Passwort merken</label>
+          <p id="f-remember-hint" class="hint">Beacon speichert nur einen daraus abgeleiteten Schlüssel, verschlüsselt für dein Windows-Konto.</p>
+        </div>
+        <div class="actions">
+          <button type="submit" id="btn-connect" class="btn btn-primary">Verbinden</button>
+          <button type="button" id="btn-disconnect" class="btn" hidden>Trennen</button>
+        </div>
+        <div id="connect-error" class="callout callout-error" role="alert" hidden></div>
+      </form>
+
+      <div class="stack">
+        <section class="card" aria-labelledby="h-conn-status">
+          <h2 id="h-conn-status">Verbindungsstatus</h2>
+          <div id="conn-detail" role="status"></div>
+          <div id="identity-box" class="callout callout-warning" hidden>
+            <h3>Server-Identität geändert</h3>
+            <p id="identity-text"></p>
+            <p>Das passiert, wenn der Betreiber das Server-Passwort geändert oder den Server neu eingerichtet hat – es kann aber auch bedeuten, dass sich jemand als dieser Server ausgibt. Beacon hat sich deshalb nicht angemeldet und dein Passwort nicht verwendet.</p>
+            <p>Frag beim Betreiber nach. <strong>Nur wenn die Änderung gewollt war:</strong> Identität zurücksetzen und mit dem (neuen) Passwort erneut verbinden.</p>
+            <button type="button" id="btn-identity-reset" class="btn btn-danger">Identität zurücksetzen</button>
+          </div>
+        </section>
+        <section class="card" aria-labelledby="h-servers">
+          <h2 id="h-servers">Zuletzt benutzte Server</h2>
+          <ul id="server-list" class="server-list"></ul>
+          <p id="server-list-empty" class="muted">Noch keine Server – nach der ersten Anmeldung erscheint der Server hier.</p>
+        </section>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================== Lobby -->
+  <section id="view-lobby" class="view" aria-labelledby="h-lobby" hidden>
+    <div class="lobby-head">
+      <div class="lobby-title">
+        <h1 id="h-lobby"><span class="sr-only">Lobby: </span><bdi id="lobby-server-name">Lobby</bdi></h1>
+        <p id="lobby-motd" class="motd" dir="auto" hidden></p>
+        <p id="lobby-meta" class="muted small" hidden>Deine virtuelle IP: <span id="lobby-vip" dir="ltr"></span></p>
+      </div>
+      <div class="lobby-actions">
+        <button type="button" id="btn-ready" class="btn" aria-pressed="false">Bereit</button>
+        <button type="button" id="btn-launch" class="btn btn-primary">BFME starten</button>
+        <button type="button" id="btn-launch-all" class="btn btn-gold" hidden>Alle starten</button>
+      </div>
+    </div>
+    <div id="lobby-banner" class="callout" role="status" hidden></div>
+    <div id="launch-error" class="callout callout-error" role="alert" hidden></div>
+    <div id="data-warning" class="callout callout-warning" hidden></div>
+
+    <div class="grid-lobby">
+      <div class="stack">
+        <section class="card" aria-labelledby="h-players">
+          <h2 id="h-players">Spieler <span id="player-count" class="muted"></span></h2>
+          <div class="table-wrap">
+            <table class="players">
+              <thead>
+                <tr>
+                  <th scope="col">Name</th>
+                  <th scope="col">Ping</th>
+                  <th scope="col">Spieldaten</th>
+                  <th scope="col">Status</th>
+                  <th scope="col"><span class="sr-only">Aktionen</span></th>
+                </tr>
+              </thead>
+              <tbody id="players-body"></tbody>
+            </table>
+          </div>
+          <p id="players-empty" class="muted">Noch keine Spieler.</p>
+        </section>
+
+        <section class="card" aria-labelledby="h-maps">
+          <div class="card-head">
+            <h2 id="h-maps">Kartenpool</h2>
+            <button type="button" id="btn-sync" class="btn btn-small">Karten synchronisieren</button>
+          </div>
+          <div id="sync-status" class="sync-status">
+            <progress id="sync-progress" max="1" value="0" hidden></progress>
+            <p id="sync-text" class="small"></p>
+          </div>
+          <ul id="maps-list" class="maps-list"></ul>
+          <p id="maps-empty" class="muted"></p>
+        </section>
+      </div>
+
+      <section class="card chat-card" aria-labelledby="h-chat">
+        <h2 id="h-chat">Chat</h2>
+        <ol id="chat-log" class="chat-log" role="log" aria-labelledby="h-chat" tabindex="0"></ol>
+        <form id="chat-form" class="chat-form" novalidate autocomplete="off">
+          <label for="chat-input" class="sr-only">Nachricht</label>
+          <input id="chat-input" type="text" maxlength="500" dir="auto" placeholder="Nachricht schreiben …">
+          <button type="submit" class="btn">Senden</button>
+        </form>
+      </section>
+    </div>
+  </section>
+
+  <!-- =================================================== Einstellungen -->
+  <section id="view-einstellungen" class="view" aria-labelledby="h-settings" hidden>
+    <h1 id="h-settings">Einstellungen</h1>
+    <form id="settings-form" class="card settings" novalidate autocomplete="off">
+      <fieldset>
+        <legend>Spielordner</legend>
+        <p class="detected">Erkannt: <span id="s-detected" dir="ltr">–</span> <span id="s-detected-src" class="badge" hidden></span></p>
+        <div class="field">
+          <label for="s-gamedir">Eigener Spielordner</label>
+          <input id="s-gamedir" type="text" spellcheck="false" dir="ltr" placeholder="leer lassen = automatisch erkennen" aria-describedby="s-gamedir-hint s-gamedir-err">
+          <p id="s-gamedir-hint" class="hint">Der Ordner mit <span dir="ltr">lotrbfme.exe</span>. Leer lassen, damit Beacon die Installation über die Registry findet.</p>
+          <p id="s-gamedir-err" class="field-error" hidden></p>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Spielstart</legend>
+        <div class="check">
+          <input id="s-windowed" type="checkbox">
+          <label for="s-windowed">Fenstermodus</label>
+        </div>
+        <div class="field">
+          <label for="s-res">Auflösung</label>
+          <select id="s-res" aria-describedby="s-res-err">
+            <option value="">Wie im Spiel eingestellt</option>
+            <option value="800x600">800 × 600</option>
+            <option value="1024x768">1024 × 768</option>
+            <option value="1280x720">1280 × 720</option>
+            <option value="1280x1024">1280 × 1024</option>
+            <option value="1366x768">1366 × 768</option>
+            <option value="1600x900">1600 × 900</option>
+            <option value="1920x1080">1920 × 1080</option>
+            <option value="2560x1440">2560 × 1440</option>
+            <option value="custom">Eigene Auflösung …</option>
+          </select>
+          <div id="s-res-custom" class="res-custom" hidden>
+            <label for="s-xres">Breite</label>
+            <input id="s-xres" type="number" min="320" max="16384" step="1" inputmode="numeric">
+            <label for="s-yres">Höhe</label>
+            <input id="s-yres" type="number" min="320" max="16384" step="1" inputmode="numeric">
+          </div>
+          <p id="s-res-err" class="field-error" hidden></p>
+        </div>
+        <div class="check">
+          <input id="s-noshellmap" type="checkbox" aria-describedby="s-noshellmap-hint">
+          <label for="s-noshellmap">Shellmap aus</label>
+          <p id="s-noshellmap-hint" class="hint">Überspringt das animierte Hauptmenü: schnellerer Start.</p>
+        </div>
+        <div class="check">
+          <input id="s-namesync" type="checkbox" aria-describedby="s-namesync-hint">
+          <label for="s-namesync">Name ins Spiel übernehmen</label>
+          <p id="s-namesync-hint" class="hint">Setzt vor jedem Start deinen LAN-Namen in BFME auf deinen Beacon-Namen. Der ursprüngliche Name wird gesichert.</p>
+        </div>
+        <div class="check">
+          <input id="s-autolaunch" type="checkbox" aria-describedby="s-autolaunch-hint">
+          <label for="s-autolaunch">Automatisch starten, wenn der Host startet</label>
+          <p id="s-autolaunch-hint" class="hint">Klickt der Host auf „Alle starten“, startet Beacon BFME bei dir von selbst.</p>
+        </div>
+      </fieldset>
+
+      <details class="advanced">
+        <summary>Erweitert</summary>
+        <fieldset>
+          <legend>Redundanz (Kopien pro Paket)</legend>
+          <p class="hint">Beacon sendet jedes Spielpaket mehrfach, damit einzelne verlorene Pakete keine Ruckler auslösen. Mehr Kopien kosten mehr Upload. Standard: Lobby 3, Spiel 2, andere 1.</p>
+          <div class="redundancy">
+            <label for="s-red-lobby">Lobby <span class="muted">(Ports 8086–8093)</span></label>
+            <select id="s-red-lobby">
+              <option value="">Standard (3)</option><option value="1">1</option><option value="2">2</option><option value="3">3</option>
+            </select>
+            <label for="s-red-game">Spiel <span class="muted">(Ports 8094–8101)</span></label>
+            <select id="s-red-game">
+              <option value="">Standard (2)</option><option value="1">1</option><option value="2">2</option><option value="3">3</option>
+            </select>
+            <label for="s-red-other">Andere Ports</label>
+            <select id="s-red-other">
+              <option value="">Standard (1)</option><option value="1">1</option><option value="2">2</option><option value="3">3</option>
+            </select>
+          </div>
+        </fieldset>
+      </details>
+
+      <div class="actions">
+        <button type="submit" class="btn btn-primary">Speichern</button>
+        <button type="button" id="s-discard" class="btn">Verwerfen</button>
+        <span id="s-status" class="small muted" role="status"></span>
+      </div>
+      <div id="settings-error" class="callout callout-error" role="alert" hidden></div>
+    </form>
+
+    <section class="card" aria-labelledby="h-lanname">
+      <h2 id="h-lanname">BFME-LAN-Name</h2>
+      <p>Stellt den LAN-Namen wieder her, den BFME vor Beacon hatte.</p>
+      <div class="actions">
+        <button type="button" id="btn-restore-name" class="btn">Ursprünglichen Namen wiederherstellen</button>
+      </div>
+    </section>
+  </section>
+
+  <!-- ======================================================== Diagnose -->
+  <section id="view-diagnose" class="view" aria-labelledby="h-diag" hidden>
+    <h1 id="h-diag">Diagnose</h1>
+    <div class="grid-diag">
+      <section class="card" aria-labelledby="h-d-game">
+        <h2 id="h-d-game">Spiel</h2>
+        <dl id="d-game" class="kv"></dl>
+        <ul id="d-game-warnings" class="warnings"></ul>
+      </section>
+      <section class="card" aria-labelledby="h-d-hook">
+        <h2 id="h-d-hook">Hook <span class="muted" dir="ltr">(wsock32.dll)</span></h2>
+        <dl id="d-hook" class="kv"></dl>
+        <h3>Spielprozess</h3>
+        <dl id="d-process" class="kv"></dl>
+      </section>
+      <section class="card" aria-labelledby="h-d-agent">
+        <h2 id="h-d-agent">Netzwerk-Agent</h2>
+        <dl id="d-agent" class="kv"></dl>
+        <h3>Registrierte Ports</h3>
+        <div class="table-wrap">
+          <table class="ports">
+            <thead>
+              <tr><th scope="col">Spiel-Port</th><th scope="col">Lokaler Port</th><th scope="col">Bestätigt</th><th scope="col">Zuletzt aktiv</th></tr>
+            </thead>
+            <tbody id="d-ports"></tbody>
+          </table>
+        </div>
+        <p id="d-ports-empty" class="muted small">Keine – das Spiel hat noch keine Netzwerk-Ports geöffnet.</p>
+      </section>
+      <section class="card" aria-labelledby="h-d-fp">
+        <h2 id="h-d-fp">Spieldaten-Fingerabdruck</h2>
+        <dl id="d-fp" class="kv"></dl>
+        <progress id="d-fp-progress" max="1" value="0" hidden></progress>
+      </section>
+      <section class="card" aria-labelledby="h-d-beacon">
+        <h2 id="h-d-beacon">Beacon</h2>
+        <dl id="d-beacon" class="kv"></dl>
+        <div class="actions">
+          <button type="button" id="btn-logs" class="btn">Log-Ordner öffnen</button>
+          <button type="button" id="btn-quit" class="btn btn-danger">Beacon beenden</button>
+        </div>
+      </section>
+      <section class="card" aria-labelledby="h-d-notices">
+        <h2 id="h-d-notices">Meldungen</h2>
+        <ol id="d-notices" class="notices"></ol>
+        <p id="d-notices-empty" class="muted small">Keine Meldungen.</p>
+      </section>
+    </div>
+  </section>
+</main>
+
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+<div id="fatal" class="fatal" hidden>
+  <div id="fatal-box" class="fatal-box" role="alertdialog" aria-modal="true" aria-labelledby="fatal-title" aria-describedby="fatal-text" tabindex="-1">
+    <h2 id="fatal-title"></h2>
+    <p id="fatal-text"></p>
+  </div>
+</div>
+
+<noscript><p class="noscript">Beacon benötigt JavaScript.</p></noscript>
+</body>
+</html>

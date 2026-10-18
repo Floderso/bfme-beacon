@@ -11,7 +11,10 @@
 //! * [`fingerprint`], [`maps`] – game-data fingerprint and map sync.
 //! * [`config`], [`paths`], [`instance`], [`logging`], [`cli`] – settings and pins,
 //!   data folder layout, single instance + handover, logs, command line.
-//! * [`sys`] – the Win32 calls (all `unsafe` code of the crate).
+//! * [`web`] – the browser UI: axum on `127.0.0.1` (token, Host/Origin checks),
+//!   JSON commands, server-sent state events, the embedded page.
+//! * [`sys`] – the Win32 calls (all `unsafe` code of the crate), including the
+//!   tray icon.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -42,6 +45,7 @@ pub mod paths;
 pub mod state;
 pub mod sys;
 pub mod util;
+pub mod web;
 
 pub use app::{App, AppOptions, CommandError, CommandErrorKind, ConnectRequest, SettingsPatch};
 pub use state::{AppState, Change};

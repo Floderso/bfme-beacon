@@ -1,17 +1,32 @@
 //! Platform layer: every Win32 call of the launcher – and with it every `unsafe`
-//! block – lives in this module (`windows.rs`). Other platforms get stubs
-//! (`other.rs`) so the portable logic still builds and its tests run there.
+//! block – lives in this module (`windows.rs`, `tray.rs`). Other platforms get
+//! stubs (`other.rs`) so the portable logic still builds and its tests run there.
 //!
 //! * DPAPI (`CryptProtectData`, user scope) for the remembered PSK.
 //! * SHA-256 through CNG (`BCryptHashData`) for the exe identity.
 //! * Registry reads (32-bit view, like the 32-bit game).
 //! * Named mutex (single instance per data directory).
 //! * Attaching to the parent console for the CLI modes of the GUI-subsystem exe.
+//! * Opening the browser / Explorer (`ShellExecuteW`) for the web UI.
+//! * The notification-area icon ([`Tray`], `Shell_NotifyIconW`).
 
+#[cfg(windows)]
+mod tray;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+pub use self::tray::{icon_pixels, Tray, ICON_SIZE};
+#[cfg(windows)]
 pub use self::windows::*;
+
+/// A choice in the tray icon's menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayCommand {
+    /// Open the UI in the browser.
+    Open,
+    /// Quit Beacon.
+    Quit,
+}
 
 #[cfg(not(windows))]
 mod other;

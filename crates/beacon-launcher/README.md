@@ -2,28 +2,32 @@
 
 The player-side program of BFME Beacon (contract: `docs/dev/architecture.md` §1,
 §4.3, §5–§8): control client, **agent** (hook ↔ relay data plane), game detection,
-hook install, Network.ini name, map sync, game-data fingerprint, game start and a
-headless CLI. The web UI is added on top of the internal API below (part 2).
+hook install, Network.ini name, map sync, game-data fingerprint, game start, a
+headless CLI and the **web UI** (German, in the default browser) on top of the
+internal API below.
 
 ```sh
 . /d/BFME-RE/env.sh
 export CARGO_TARGET_DIR=/d/BFME-RE/build/target-launcher
 export CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=false   # see "Smart App Control" below
 cargo build -p beacon-launcher [--release]            # -> $CARGO_TARGET_DIR/{debug,release}/Beacon.exe
-cargo test -p beacon-launcher                         # unit + tests/app.rs (in-process server)
+cargo test -p beacon-launcher                         # unit + tests/app.rs + tests/web.rs
 cargo clippy -p beacon-launcher --all-targets -- -D warnings
 cargo hook                                            # the wsock32.dll that ships next to Beacon.exe
 ```
 
 Ship `Beacon.exe` together with `wsock32.dll` (`cargo hook` output) in one folder.
 Dependencies: `beacon-proto` (its `snow`/`blake3` re-exports), `tokio`, `serde`,
-`serde_json`, `tracing(-subscriber)`, `getrandom`, `windows-sys` (all already in the
-workspace graph); `beacon-server` only as a dev-dependency.
+`serde_json`, `tracing(-subscriber)`, `getrandom`, `windows-sys`, `axum` (same
+features as beacon-server) and `futures-core` (the `Stream` trait for the event
+stream) – all already in the workspace graph, none with a build script of its own;
+`beacon-server` only as a dev-dependency.
 
 ## Command line
 
 ```text
-Beacon.exe [OPTIONS]                       default mode: starts the app (UI not built yet: headless, Ctrl+C quits)
+Beacon.exe [OPTIONS] [--no-browser] [--no-tray]
+                                           default mode: app + web UI in the browser + tray icon
 Beacon.exe connect --server HOST[:PORT] --name NAME (--password-stdin | --remembered)
            [--remember] [--launch] [--windowed] [--xres W] [--yres H] [OPTIONS]
 Beacon.exe detect [OPTIONS]                JSON: game folder, exe identity, user folders, hook status (exit 1 = not found)
@@ -47,6 +51,10 @@ OPTIONS: --instance N (1..=8)  --multi  --data-dir DIR  --game-dir DIR  --hook-d
   (`kill -INT` has no effect on them): stop a background session with
   `Beacon.exe stop --instance N`.
 * Test mode (two BFME instances on one PC): `--instance 2` (or `--multi`).
+* Default mode: see [Web UI](#web-ui). `--no-browser` only logs the URL (with the
+  token), `--no-tray` shows no notification-area icon. Fatal start-up errors
+  (data folder, instance check, start of the app or the web server) appear in a
+  German message box in release builds (no console there); debug builds log them.
 
 ## Data folder
 
@@ -130,8 +138,10 @@ per file; chunks (≤ 32 KiB, paced below the server's limit) go to a temporary 
 size + BLAKE3 are verified, then it is renamed into place and recorded.
 
 **Single instance** (`instance`): named mutex per data folder + `running.json`; a
-second start hands over to the running one (`Activate` → `Change::Activate`, the
-UI will open the browser; `Quit` = `Beacon.exe stop`).
+second start hands over to the running one (`Activate` → `Change::Activate`: the
+running default-mode instance opens the browser with its UI URL again; `Quit` =
+`Beacon.exe stop`) and ends with exit code 0. If the running instance does not
+answer, the second start shows an error box and exits 1.
 
 ## Internal API (for the UI)
 
@@ -191,6 +201,81 @@ sync {running, current, bytes_done, bytes_total, downloaded, last_error}}`, `gam
 `peer_files`, `settings` (config without secrets: servers with `pinned_name`,
 `pinned_at_ms`, `remembered`), `notices` (last 50 `{id, ts_ms, level, text}`).
 
+## Web UI
+
+`web::WebServer::start(app, WebOptions)` (default mode) serves the page and a JSON +
+server-sent-events API on `127.0.0.1:0`; `Beacon.exe` then opens
+`http://127.0.0.1:PORT/#t=<token>` with `ShellExecuteW` (a fresh random 128-bit
+token per run). The page moves the token into `sessionStorage` (per tab) and removes
+it from the address bar; `#t=<token>&v=diagnose` opens another view first
+(`verbinden`, `lobby`, `einstellungen`, `diagnose`).
+
+**Security** (`web/guard.rs`): bound to `127.0.0.1` only; every request needs
+`Host: 127.0.0.1:PORT` or `localhost:PORT` (DNS rebinding; an absolute-form target
+must name the same authority); every `/api` request needs `X-Beacon-Token`
+(constant-time compare), an `Origin` header – if present – must be this origin and
+`Sec-Fetch-Site` – if present – `same-origin`/`none`. Failures answer `403
+{"ok":false,"error":{"kind":"forbidden","reason":"host|origin|fetch_site|token"}}`.
+No CORS headers; JSON bodies only (`Content-Type: application/json`, ≤ 64 KiB);
+every response carries a strict CSP (`default-src 'none'; script-src 'self'; …;
+frame-ancestors 'none'`), `nosniff`, `X-Frame-Options: DENY`, `no-store`,
+`no-referrer`. The page puts server and player data (names, chat, MOTD, map names,
+paths, error texts) into the DOM only with `textContent`/`createElement`, never
+`innerHTML`; player text is bidi-isolated (`<bdi>`, `dir="auto"`).
+
+**API** (success `{"ok":true,…}`, failure: HTTP status + `{"ok":false,"error":{kind,
+field?, reason?, message}}` with `kind` = a `CommandErrorKind` or `forbidden`,
+`bad_request`, `not_found`, `too_many_streams`, `internal`; `reason` names a broken
+input rule such as `name_too_long`, `invalid_address`, `resolution_range`):
+
+| Route | Body | |
+|---|---|---|
+| `GET /api/state` | | `AppState` |
+| `GET /api/events` | | SSE: `event: state` (full state) at once and after changes, coalesced to ≤ 10/s; `event: quit` when Beacon ends; keep-alive comments every 15 s; ≤ 8 streams (`429`), a client stalled for 30 s is dropped |
+| `POST /api/connect` | `{server, name, password?, remember?, use_remembered?}` | no password = use the remembered key |
+| `POST /api/disconnect`, `/api/launch`, `/api/launch_all`, `/api/maps/sync`, `/api/quit` | `{}` | |
+| `POST /api/chat` / `/api/ready` / `/api/kick` | `{text}` / `{ready}` / `{name}` | |
+| `POST /api/fingerprint` | `{name}` | that player's file list → `peer_files` |
+| `POST /api/settings` | `SettingsPatch` (`player_name`, `game_dir`, `launch {windowed, xres, yres, noshellmap}`, `name_sync`, `auto_launch_on_host_start`, `redundancy {lobby, game, other}`) | |
+| `POST /api/pin/reset`, `/api/password/forget` | `{server}` | `{removed}` |
+| `POST /api/name/restore` | `{}` | `{restored}`: BFME's original LAN name |
+| `POST /api/logs/open` | `{}` | shows the log folder in Explorer |
+
+**Page** (`ui/index.html`, `app.js`, `style.css`, `favicon.svg`, embedded with
+`include_str!`; plain JS, no CDN, no build step; German; dark with gold/bronze
+accents; responsive; labels, focus rings, `prefers-reduced-motion`,
+`forced-colors`). The event stream is read with `fetch` (EventSource cannot send
+the token header) and reconnects with backoff; an unknown token shows "Sitzung
+ungültig", the end of Beacon "Beacon wurde beendet". Views:
+
+* **Verbinden** – server address (port 28086 by default), player name (checked like
+  Beacon checks it), password, "Passwort merken", recently used servers (pinned
+  name, "Passwort vergessen", "Identität zurücksetzen"), connection status with
+  reconnect countdown; a changed server identity is explained with a reset button.
+* **Lobby** – server name, MOTD, own vIP; players with host crown, ping + loss,
+  game data vs. the host (`✓ wie Host` / `✗ weicht ab` with the differing files
+  on request, own data "wird geprüft …" while fingerprinting), ready, "im Spiel",
+  host-only Kick; chat with timestamps; map pool with state and sync progress;
+  buttons Bereit, "BFME starten", host-only "Alle starten".
+* **Einstellungen** – detected game folder and override, Fenstermodus +
+  Auflösung, Shellmap aus, Name ins Spiel übernehmen, automatisch starten wenn der
+  Host startet, Erweitert: Redundanz; restore the original LAN name.
+* **Diagnose** – game detection and exe identity, hook state/version (and
+  "Firewall-Abfrage: übersprungen": the hook answers BFME's XP firewall query
+  itself), game process, agent RTT/loss/packet counters/registered ports,
+  fingerprint, Beacon version and data folder, notices, "Log-Ordner öffnen",
+  "Beacon beenden".
+
+Every typed error has a German text (wrong password, server unreachable, identity
+changed, game not found, foreign `wsock32.dll`, Smart App Control with an
+explanation, "Als Administrator ausführen", …); Beacon's English detail is shown
+below it. Known core notices are translated, unknown ones are shown as they are.
+
+**Tray** (`sys/tray.rs`): a hidden window on its own thread with
+`Shell_NotifyIconW` (version 4), an icon drawn at run time (gold beacon fire on a
+dark disc), click/Enter = "Öffnen", context menu "Öffnen" / "Beenden"; it is added
+again after an Explorer restart and removed on exit.
+
 ## Tests
 
 * Unit tests: config + pinning + DPAPI, addresses and names, CLI, path checks and map
@@ -204,6 +289,19 @@ sync {running, current, bytes_done, bytes_total, downloaded, last_error}}`, `gam
   `SEND`/`DELIVER` with the correct source exactly once and no echo, map sync of a
   test map, wrong password, remembered key, and a changed salt on the same address
   refused by the pin until it is reset.
+* `tests/web.rs`: `WebServer` over real TCP with a raw HTTP/1.1 client: missing,
+  wrong, truncated and upper-case tokens, foreign `Host` (incl. absolute-form
+  targets, HTTP/1.0 without `Host`), foreign/`null` `Origin`, cross-site
+  `Sec-Fetch-Site`, CORS preflight → `403` without CORS headers; security headers;
+  state shape without secrets; embedded assets (types, no inline script/style, no
+  `innerHTML` in `app.js`); SSE: full state first, changes, throttling, `quit`,
+  stream limit and freed slots; input validation reasons and saved settings; a
+  real in-process server: connect, chat, ready, remembered password, disconnect
+  through the API. Unit tests: Host/Origin/fetch-site rules, error kinds, input
+  rules, tray icon pixels.
+* Manually checked (not automated): the release `Beacon.exe` in default mode with
+  tray, handover of a second start, two instances in one lobby against a local
+  `beacon-server`, all four views rendered by headless Edge.
 
 ## Smart App Control
 
@@ -218,7 +316,12 @@ hook harness exe was blocked when rebuilt here, the identical harness from
 
 ## Limitations
 
-* The web UI is not part of this crate yet; the default mode runs headless.
+* Web UI: Beacon's own notices and error details are English strings; the page
+  translates the known ones and shows others unchanged. The page's JavaScript has
+  no automated tests (only the HTTP side is tested); kick, quit and pin reset ask
+  with the browser's `confirm()`. A tab of an earlier run cannot reconnect (new
+  port and token): reopen the UI from `Beacon.exe` or the tray.
+* The tray icon's colours were checked as pixels only (`icon_pixels`), not on screen.
 * Interactive Ctrl+C in mintty depends on Git for Windows forwarding it to native
   processes; scripts use `Beacon.exe stop`.
 * Map/file writes in the map sync are small blocking writes on a runtime thread.

@@ -34,18 +34,28 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 # Local token, handover token, jitter (same version as snow's).
 getrandom = "0.3.4"
+# Web UI on 127.0.0.1 (same feature set as beacon-server; no build scripts).
+axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json"] }
+# Only the `Stream` trait for the SSE body (already in axum's graph, no build script).
+futures-core = { version = "0.3.34", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-# DPAPI, SHA-256 (CNG), registry, named mutex, console attach. Already in the
-# dependency graph through tokio/socket2/getrandom (raw-dylib, no import libs).
+# DPAPI, SHA-256 (CNG), registry, named mutex, console attach, opening the
+# browser/Explorer (ShellExecuteW) and the tray icon. Already in the dependency
+# graph through tokio/socket2/getrandom (raw-dylib, no import libs).
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_Console",
+    "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

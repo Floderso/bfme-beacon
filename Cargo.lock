@@ -113,8 +113,10 @@ dependencies = [
 name = "beacon-launcher"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "beacon-proto",
  "beacon-server",
+ "futures-core",
  "getrandom",
  "serde",
  "serde_json",

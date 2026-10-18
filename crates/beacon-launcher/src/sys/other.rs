@@ -4,7 +4,7 @@
 use std::io;
 use std::path::Path;
 
-use super::{Hive, SHA256_LEN};
+use super::{Hive, TrayCommand, SHA256_LEN};
 
 fn unsupported() -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, "only available on Windows")
@@ -49,4 +49,30 @@ impl NamedMutex {
 /// Nothing to attach to.
 pub fn attach_parent_console() -> bool {
     false
+}
+
+/// Not available: there is no shell to hand the URL to.
+pub fn open_url(_url: &str) -> io::Result<()> {
+    Err(unsupported())
+}
+
+/// Not available: the text goes to stderr instead.
+pub fn message_box(title: &str, text: &str) {
+    eprintln!("{title}: {text}");
+}
+
+/// Not available: there is no Explorer.
+pub fn open_folder(_path: &Path) -> io::Result<()> {
+    Err(unsupported())
+}
+
+/// No notification area: [`Tray::start`] always fails.
+#[derive(Debug)]
+pub struct Tray;
+
+impl Tray {
+    /// Not available.
+    pub fn start(_tooltip: &str, _callback: impl Fn(TrayCommand) + Send + 'static) -> io::Result<Self> {
+        Err(unsupported())
+    }
 }

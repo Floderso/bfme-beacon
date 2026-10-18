@@ -1,7 +1,8 @@
 //! Hand-written command-line parser (no dependencies).
 //!
 //! ```text
-//! Beacon.exe [OPTIONS]                       start the app (default mode)
+//! Beacon.exe [OPTIONS] [--no-browser] [--no-tray]
+//!                                            start the app with the web UI (default mode)
 //! Beacon.exe connect --server HOST[:PORT] --name NAME (--password-stdin | --remembered)
 //!            [--remember] [--launch] [--windowed] [--xres W] [--yres H] [OPTIONS]
 //! Beacon.exe detect [OPTIONS]                JSON: game folder, exe identity, user dir, hook
@@ -35,6 +36,10 @@ pub struct Common {
     pub hook_dll: Option<PathBuf>,
     /// `-v` / `--verbose`: debug logging.
     pub verbose: bool,
+    /// `--no-browser` (default mode): do not open the browser, log the URL.
+    pub no_browser: bool,
+    /// `--no-tray` (default mode): no notification-area icon.
+    pub no_tray: bool,
 }
 
 /// Where the password comes from.
@@ -114,7 +119,8 @@ pub const USAGE: &str = "\
 BFME Beacon launcher
 
 Usage:
-  Beacon.exe [OPTIONS]                         start Beacon
+  Beacon.exe [OPTIONS] [--no-browser] [--no-tray]
+                                               start Beacon (web UI in the browser, tray icon)
   Beacon.exe connect --server HOST[:PORT] --name NAME (--password-stdin | --remembered)
              [--remember] [--launch] [--windowed] [--xres W] [--yres H] [OPTIONS]
                                                headless session, logs to stdout until Ctrl-C
@@ -199,6 +205,7 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
     let (mut remember, mut launch, mut windowed) = (false, false, false);
     let (mut xres, mut yres) = (None, None);
     let connect = sub == "connect";
+    let default_mode = sub.is_empty();
     let mut it = Args { items: rest, pos: 0 };
     while let Some((opt, inline)) = it.next() {
         match opt {
@@ -219,6 +226,14 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             "-v" | "--verbose" => {
                 flag(opt, inline)?;
                 common.verbose = true;
+            }
+            "--no-browser" if default_mode => {
+                flag(opt, inline)?;
+                common.no_browser = true;
+            }
+            "--no-tray" if default_mode => {
+                flag(opt, inline)?;
+                common.no_tray = true;
             }
             "--server" if connect => server = Some(it.value(opt, inline)?.to_owned()),
             "--name" if connect => name = Some(it.value(opt, inline)?.to_owned()),
@@ -319,6 +334,11 @@ mod tests {
         };
         assert_eq!((c.instance, c.multi), (2, true));
         assert_eq!(c.data_dir, Some(PathBuf::from(r"D:\b")));
+        assert!(!c.no_browser && !c.no_tray);
+        let Command::Run(c) = p(&["--no-browser", "--no-tray"]).unwrap() else { panic!() };
+        assert!(c.no_browser && c.no_tray);
+        assert!(p(&["detect", "--no-browser"]).is_err(), "only for the default mode");
+        assert!(p(&["--no-tray=1"]).is_err());
     }
 
     #[test]

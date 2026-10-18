@@ -1,5 +1,5 @@
 //! Win32 implementation of the platform layer. Every `unsafe` block of the launcher
-//! is in this file; each one documents why its pointers are valid.
+//! is in this file or in `tray.rs`; each one documents why its pointers are valid.
 
 #![allow(unsafe_code)]
 
@@ -23,11 +23,18 @@ use windows_sys::Win32::System::Console::{
     AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE,
 };
+use windows_sys::Win32::System::Com::{
+    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+};
 use windows_sys::Win32::System::Registry::{
     RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
     RRF_SUBKEY_WOW6432KEY,
 };
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, SW_SHOWNORMAL,
+};
 
 use super::{Hive, SHA256_LEN};
 
@@ -36,7 +43,8 @@ const DPAPI_DESCRIPTION: &str = "BFME Beacon server key";
 /// Largest registry string the launcher reads (bytes).
 const REG_STRING_MAX: u32 = 64 * 1024;
 
-fn wide(s: &str) -> Vec<u16> {
+/// NUL-terminated UTF-16 of `s`.
+pub(super) fn wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
 }
 
@@ -320,5 +328,83 @@ pub fn attach_parent_console() -> bool {
             }
         }
         true
+    }
+}
+
+/// Opens `target` with its default handler (`ShellExecuteW`, verb "open") on a
+/// short-lived thread that initialises COM as the shell requires; returns once the
+/// shell has handed it over (the browser or Explorer may still be starting).
+fn shell_open(target: &OsStr) -> io::Result<()> {
+    if target.is_empty() || target.encode_wide().any(|c| c == 0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty target or NUL in it"));
+    }
+    let file: Vec<u16> = target.encode_wide().chain(Some(0)).collect();
+    let verb = wide("open");
+    let worker = std::thread::Builder::new()
+        .name("beacon-shell".into())
+        .spawn(move || {
+            // SAFETY: COM is initialised for this thread only and released below;
+            // `verb` and `file` are NUL-terminated UTF-16 strings that live across
+            // the call; null window/parameters/directory are allowed.
+            unsafe {
+                let hr = CoInitializeEx(ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32);
+                let result = ShellExecuteW(
+                    ptr::null_mut(),
+                    verb.as_ptr(),
+                    file.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    SW_SHOWNORMAL,
+                );
+                if hr >= 0 {
+                    CoUninitialize();
+                }
+                result as isize
+            }
+        })?;
+    let code = worker
+        .join()
+        .map_err(|_| io::Error::other("the shell thread failed"))?;
+    // ShellExecuteW: values above 32 mean success.
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("ShellExecuteW failed (code {code})")))
+    }
+}
+
+/// Opens an `http://` or `https://` URL in the default browser.
+pub fn open_url(url: &str) -> io::Result<()> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "only http(s) URLs are opened"));
+    }
+    shell_open(OsStr::new(url))
+}
+
+/// Shows a folder in Explorer.
+pub fn open_folder(path: &Path) -> io::Result<()> {
+    if !path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} is not a folder", path.display()),
+        ));
+    }
+    shell_open(path.as_os_str())
+}
+
+/// Shows a modal error box (for fatal start-up errors of the GUI-subsystem exe,
+/// which has no console). Blocks until the user closes it.
+pub fn message_box(title: &str, text: &str) {
+    let title = wide(&title.replace('\0', " "));
+    let text = wide(&text.replace('\0', " "));
+    // SAFETY: both strings are NUL-terminated UTF-16 without inner NULs that live
+    // across the call; a null owner window is allowed.
+    unsafe {
+        MessageBoxW(
+            ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
     }
 }
